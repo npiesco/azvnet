@@ -30,6 +30,7 @@ from azvnet.remote import (
     linux_key_setup,
     decrypt_payload,
     parse_completion,
+    output_chunk_script,
 )
 from azvnet.tofu import (
     configuration_bundle,
@@ -323,6 +324,18 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class ExecutableTests(unittest.TestCase):
+    def test_chunk_retrieval_uses_captured_streams(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            (Path(scratch) / "response.b64").write_text("ABCDEFGHIJK")
+            script = output_chunk_script(scratch, 2, 4, windows=False)
+            result = subprocess.run(
+                ["bash"], input=script, text=True, capture_output=True, check=True
+            )
+            self.assertEqual(result.stdout, "CDEF")
+        windows = output_chunk_script(r"C:\private", 2, 4, windows=True)
+        self.assertTrue(windows.startswith("Write-Output "))
+        self.assertNotIn("[Console]", windows)
+
     def test_sealed_output_bound_fails_without_disclosing_output(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)

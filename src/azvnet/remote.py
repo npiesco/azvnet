@@ -267,6 +267,18 @@ cat cert.pem
 """
 
 
+def output_chunk_script(
+    directory: str, offset: int, size: int, *, windows: bool
+) -> str:
+    if windows:
+        return rf"Write-Output ([IO.File]::ReadAllText('{directory}\response.b64').Substring({offset},{size}))"
+    return f"""python3 - <<'PY'
+with open({directory + "/response.b64"!r}) as stream:
+    stream.seek({offset})
+    print(stream.read({size}), end="")
+PY"""
+
+
 class Remote:
     def __init__(self, session: AzureSession):
         self.session = session
@@ -469,14 +481,9 @@ try {{
             chunks = []
             for offset in range(0, length, OUTPUT_CHUNK_SIZE):
                 size = min(OUTPUT_CHUNK_SIZE, length - offset)
-                if windows:
-                    retrieval = rf"[Console]::Write([IO.File]::ReadAllText('{directory}\response.b64').Substring({offset},{size}))"
-                else:
-                    retrieval = f"""python3 - <<'PY'
-with open({directory + "/response.b64"!r}) as stream:
-    stream.seek({offset})
-    print(stream.read({size}), end="")
-PY"""
+                retrieval = output_chunk_script(
+                    directory, offset, size, windows=windows
+                )
                 chunk = self.run(
                     group, name, retrieval, windows=windows, capture=True
                 ).stdout.strip()
