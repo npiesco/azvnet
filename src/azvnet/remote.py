@@ -13,6 +13,19 @@ from collections.abc import Callable, Iterator
 
 from .auth import AzureSession, AzvnetError
 
+MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+OUTPUT_CHUNK_SIZE = 2048
+
+
+class RemoteExecutionError(AzvnetError):
+    """Guest failure with decrypted diagnostics available without logging them."""
+
+    def __init__(self, returncode: int, stdout: str, stderr: str):
+        super().__init__(
+            f"sealed guest exited {returncode}; inspect exception.stdout/stderr privately"
+        )
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
 
 @contextmanager
 def cleanup_after(action: Callable[[], object]) -> Iterator[None]:
@@ -40,15 +53,37 @@ def completion_script(script: str, token: str, *, windows: bool = False) -> str:
         return (
             "$ErrorActionPreference = 'Stop'\n"
             "$global:LASTEXITCODE = 0\n"
-            "& {\n" + script + "\n}\n"
+            "$transcript = Join-Path $env:TEMP ([Guid]::NewGuid().ToString('N'))\n"
+            "New-Item -ItemType Directory -Path $transcript | Out-Null\n"
+            "try {\n"
+            "& {\n" + script + '\n} 1> "$transcript\\stdout" 2> "$transcript\\stderr"\n'
             'if ($LASTEXITCODE -ne 0) { throw "Native command failed: $LASTEXITCODE" }\n'
+            '$document = @{ stdout=[IO.File]::ReadAllText("$transcript\\stdout"); stderr=[IO.File]::ReadAllText("$transcript\\stderr") } | ConvertTo-Json -Compress\n'
+            "Write-Output ('AZVNETSTREAM ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($document)))\n"
             f"Write-Output '{token}'\n"
+            "} finally { Remove-Item -LiteralPath $transcript -Recurse -Force }\n"
         )
     return (
         "set -eu\n"
-        f"/bin/bash -seuo pipefail <<'{token}BODY'\n"
+        "umask 077\n"
+        "transcript=$(mktemp -d)\n"
+        """trap 'rm -rf -- "$transcript"' EXIT\n"""
+        "status=0\n"
+        f"""/bin/bash -seuo pipefail >"$transcript/stdout" 2>"$transcript/stderr" <<'{token}BODY' || status=$?\n"""
         + script
         + f"\n{token}BODY\n"
+        + """if [ "$status" -ne 0 ]; then
+  cat "$transcript/stdout"
+  cat "$transcript/stderr" >&2
+  exit "$status"
+fi
+python3 - "$transcript" <<'PY'
+import base64, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+document = {key: (root / key).read_text(errors="replace") for key in ("stdout", "stderr")}
+print("AZVNETSTREAM " + base64.b64encode(json.dumps(document).encode()).decode())
+PY
+"""
         + f"printf '\\n%s\\n' '{token}'\n"
     )
 
@@ -94,8 +129,18 @@ def parse_completion(
     lines = stdout.strip("\r\n").splitlines()
     if not lines or lines[-1] != token or lines.count(token) != 1:
         raise failure("missing exact invocation-bound completion proof")
-    output = "\n".join(lines[:-1]).rstrip("\r\n") + ("\n" if len(lines) > 1 else "")
-    return output, stderr.lstrip("\r\n")
+    frames = [line for line in lines[:-1] if line]
+    if len(frames) != 1 or not frames[0].startswith("AZVNETSTREAM "):
+        raise failure("missing or truncated output frame")
+    try:
+        document = json.loads(base64.b64decode(frames[0][13:], validate=True))
+        if not isinstance(document["stdout"], str) or not isinstance(
+            document["stderr"], str
+        ):
+            raise ValueError("invalid stream types")
+    except (ValueError, KeyError, TypeError) as error:
+        raise failure("invalid or truncated output frame") from error
+    return document["stdout"], document["stderr"] + stderr.lstrip("\r\n")
 
 
 def encrypt_payload(certificate: str, payload: bytes) -> str:
@@ -120,17 +165,94 @@ def encrypt_payload(certificate: str, payload: bytes) -> str:
         return base64.b64encode(result.stdout).decode("ascii")
 
 
-def linux_envelope(directory: str, ciphertext: str) -> str:
+def linux_envelope(
+    directory: str,
+    ciphertext: str,
+    output_certificate: str | None = None,
+) -> str:
     path = shlex.quote(directory)
-    return f"""set -euo pipefail
+    cleanup = (
+        "rm -f -- "
+        + " ".join(
+            f'"$directory/{name}"'
+            for name in (
+                "key.pem",
+                "cert.pem",
+                "payload.cms",
+                "payload.sh",
+                "stdout",
+                "stderr",
+                "response.json",
+                "caller.pem",
+            )
+        )
+        if output_certificate is not None
+        else """rm -rf -- "$directory" """
+    )
+    script = f"""set -euo pipefail
 directory={path}
-trap 'rm -rf -- "$directory"' EXIT
+trap '{cleanup}' EXIT
 cd "$directory"
 printf %s {shlex.quote(ciphertext)} | base64 -d > payload.cms
 openssl cms -decrypt -binary -inform DER -in payload.cms -recip cert.pem -inkey key.pem -out payload.sh
 chmod 600 payload.sh
-/bin/bash -euo pipefail payload.sh
 """
+    if output_certificate is None:
+        return (
+            script
+            + """/bin/bash -euo pipefail payload.sh
+"""
+        )
+    encoded_cert = base64.b64encode(output_certificate.encode()).decode()
+    return (
+        script
+        + f"""printf %s {encoded_cert} | base64 -d > caller.pem
+status=0
+/bin/bash -euo pipefail payload.sh >stdout 2>stderr || status=$?
+python3 - "$status" <<'PY'
+import json, pathlib, sys
+out, err = pathlib.Path("stdout"), pathlib.Path("stderr")
+if out.stat().st_size + err.stat().st_size > {MAX_OUTPUT_BYTES}:
+    raise SystemExit("sealed output exceeds the configured transport bound")
+pathlib.Path("response.json").write_text(json.dumps({{
+    "returncode": int(sys.argv[1]),
+    "stdout": out.read_text(errors="replace"),
+    "stderr": err.read_text(errors="replace"),
+}}))
+PY
+openssl cms -encrypt -binary -aes256 -outform DER -in response.json -out response.cms caller.pem
+base64 -w0 response.cms > response.b64
+printf 'AZVNETOUTPUT %s\\n' "$(wc -c < response.b64)"
+"""
+    )
+
+
+def decrypt_payload(directory: Path, ciphertext: str) -> tuple[int, str, str]:
+    result = subprocess.run(
+        [
+            "openssl",
+            "cms",
+            "-decrypt",
+            "-binary",
+            "-inform",
+            "DER",
+            "-recip",
+            str(directory / "cert.pem"),
+            "-inkey",
+            str(directory / "key.pem"),
+        ],
+        input=base64.b64decode(ciphertext, validate=True),
+        capture_output=True,
+        check=True,
+    )
+    document = json.loads(result.stdout)
+    if (
+        not isinstance(document.get("returncode"), int)
+        or not isinstance(document.get("stdout"), str)
+        or not isinstance(document.get("stderr"), str)
+    ):
+        raise AzvnetError("invalid sealed response")
+    return document["returncode"], document["stdout"], document["stderr"]
 
 
 def linux_key_setup(directory: str) -> str:
@@ -196,7 +318,53 @@ class Remote:
         windows: bool = False,
         capture: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        """Encrypt to a fresh guest key; only ciphertext enters agent script storage."""
+        """Encrypt both script input and captured output with per-invocation keys."""
+        with tempfile.TemporaryDirectory(prefix="azvnet-output-") as scratch:
+            caller = Path(scratch)
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:3072",
+                    "-nodes",
+                    "-keyout",
+                    str(caller / "key.pem"),
+                    "-out",
+                    str(caller / "cert.pem"),
+                    "-subj",
+                    "/CN=azvnet-output",
+                    "-days",
+                    "1",
+                ],
+                capture_output=True,
+                check=True,
+            )
+            encrypted = self._sealed(
+                group,
+                name,
+                script,
+                windows=windows,
+                output_certificate=(caller / "cert.pem").read_text(),
+            )
+            status, output, errors = decrypt_payload(caller, encrypted)
+        if status:
+            raise RemoteExecutionError(status, output, errors)
+        if not capture:
+            print(output, end="")
+            print(errors, end="", file=sys.stderr)
+        return subprocess.CompletedProcess(["sealed-run-command"], 0, output, errors)
+
+    def _sealed(
+        self,
+        group: str,
+        name: str,
+        script: str,
+        *,
+        windows: bool,
+        output_certificate: str,
+    ) -> str:
         nonce = secrets.token_hex(24)
         if windows:
             directory = rf"C:\ProgramData\azvnet-{nonce}"
@@ -245,16 +413,30 @@ $certs = New-Object System.Security.Cryptography.X509Certificates.X509Certificat
 [void]$certs.Add($cert)
 $cms.Decrypt($certs)
 $payload = [Text.Encoding]::UTF8.GetString($cms.ContentInfo.Content)
+Set-Content -LiteralPath "$d\payload.ps1" -Encoding UTF8 -Value ("`$ErrorActionPreference = 'Stop'`n" + $payload + "`nif (`$LASTEXITCODE -ne 0) {{ exit `$LASTEXITCODE }}")
 $executionFailure = $null
 try {{
-  & ([ScriptBlock]::Create($payload))
+  $process = Start-Process powershell.exe -Wait -PassThru -ArgumentList @('-NoProfile','-NonInteractive','-File',"$d\payload.ps1") -RedirectStandardOutput "$d\stdout" -RedirectStandardError "$d\stderr"
+  if ((Get-Item "$d\stdout").Length + (Get-Item "$d\stderr").Length -gt {MAX_OUTPUT_BYTES}) {{ throw 'sealed output exceeds the configured transport bound' }}
+  $response = @{{ returncode = $process.ExitCode; stdout = [IO.File]::ReadAllText("$d\stdout"); stderr = [IO.File]::ReadAllText("$d\stderr") }} | ConvertTo-Json -Compress
+  $recipientBytes = [Convert]::FromBase64String('{base64.b64encode(output_certificate.encode()).decode()}')
+  $pem = [Text.Encoding]::ASCII.GetString($recipientBytes)
+  $der = [Convert]::FromBase64String(($pem -replace '-----[^-]+-----','' -replace '\s',''))
+  $recipient = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(,$der)
+  $content = New-Object System.Security.Cryptography.Pkcs.ContentInfo(,[Text.Encoding]::UTF8.GetBytes($response))
+  $algorithm = New-Object System.Security.Cryptography.Pkcs.AlgorithmIdentifier([System.Security.Cryptography.Oid]::new('2.16.840.1.101.3.4.1.42'))
+  $encrypted = New-Object System.Security.Cryptography.Pkcs.EnvelopedCms($content,$algorithm)
+  $encrypted.Encrypt((New-Object System.Security.Cryptography.Pkcs.CmsRecipient($recipient)))
+  $encoded = [Convert]::ToBase64String($encrypted.Encode())
+  [IO.File]::WriteAllText("$d\response.b64", $encoded)
+  Write-Output "AZVNETOUTPUT $($encoded.Length)"
 }} catch {{
   $executionFailure = $_
   throw
 }} finally {{
   try {{
     Remove-Item ("Cert:\LocalMachine\My\" + $cert.Thumbprint) -DeleteKey
-    Remove-Item -LiteralPath $d -Recurse -Force
+    Remove-Item -LiteralPath "$d\payload.ps1","$d\stdout","$d\stderr" -Force
   }} catch {{
     if ($null -eq $executionFailure) {{ throw }}
     Write-Warning "Cleanup also failed: $_"
@@ -262,5 +444,43 @@ try {{
 }}
 """
             else:
-                execution = linux_envelope(directory, ciphertext)
-            return self.run(group, name, execution, windows=windows, capture=capture)
+                execution = linux_envelope(directory, ciphertext, output_certificate)
+            manifest = (
+                self.run(
+                    group,
+                    name,
+                    execution,
+                    windows=windows,
+                    capture=True,
+                )
+                .stdout.strip()
+                .split()
+            )
+            if (
+                len(manifest) != 2
+                or manifest[0] != "AZVNETOUTPUT"
+                or not manifest[1].isdigit()
+            ):
+                raise AzvnetError("missing sealed output manifest")
+            length = int(manifest[1])
+            # JSON escaping and base64 can expand plaintext by up to eight times.
+            if not 0 < length <= MAX_OUTPUT_BYTES * 8 + 16384:
+                raise AzvnetError("sealed output length exceeds the retrieval bound")
+            chunks = []
+            for offset in range(0, length, OUTPUT_CHUNK_SIZE):
+                size = min(OUTPUT_CHUNK_SIZE, length - offset)
+                if windows:
+                    retrieval = rf"[Console]::Write([IO.File]::ReadAllText('{directory}\response.b64').Substring({offset},{size}))"
+                else:
+                    retrieval = f"""python3 - <<'PY'
+with open({directory + "/response.b64"!r}) as stream:
+    stream.seek({offset})
+    print(stream.read({size}), end="")
+PY"""
+                chunk = self.run(
+                    group, name, retrieval, windows=windows, capture=True
+                ).stdout.strip()
+                if len(chunk) != size:
+                    raise AzvnetError("sealed output chunk was truncated")
+                chunks.append(chunk)
+            return "".join(chunks)

@@ -53,7 +53,7 @@ deployment values; `enabled` must be an input declared by that configuration.
   "state_endpoint": "<storage account>.blob.core.windows.net",
   "bootstrap": {
     "location": "<state VNet region>",
-    "subnet": "<existing subnet in the state VNet>",
+    "subnet": "<subnet in the state VNet>",
     "image": "Ubuntu2404",
     "size": "<permitted Linux VM size>"
   },
@@ -64,10 +64,14 @@ deployment values; `enabled` must be an input declared by that configuration.
 
 You still need Python 3.12+, Azure CLI, OpenSSL and `ssh-keygen` locally.
 Guests need Bash, Python 3, OpenSSL, curl and tar. State storage, private DNS,
-the VNet/subnet, outbound access and a user-assigned managed identity with
+the VNet, outbound access and a user-assigned managed identity with
 provider/backend permissions must already exist. The service principal needs
 Run Command, VM/identity-attachment and task-resource-group create/delete
-permissions. azvnet does not grant roles or build your persistent network.
+permissions. azvnet does not grant roles or build your persistent VNet.
+The subnet must exist unless `Bootstrap(subnet_cidr="...")` explicitly permits
+on-demand creation. Subnets are enumerated with a checked request first;
+authentication failures cannot be mistaken for absence. Existing subnets and
+their NSG/NAT associations are left unchanged.
 
 ## Authenticate without changing your CLI context
 
@@ -91,6 +95,8 @@ Login invokes that CLI over stdin so its secret never enters the OS command
 line. Each service-principal session owns a mode-0700 temporary Azure config
 directory and removes it on exit. It never changes global `os.environ` or
 calls `az account set`.
+On Linux, `TMPDIR=/dev/shm` keeps temporary credentials and transport keys in
+memory-backed storage (the caller must still close the session).
 
 ## Keep local state local
 
@@ -136,6 +142,13 @@ creation, identity attachment, reachability, execution and failure before the
 host is yielded. Deletion requires the exact invocation's ownership tag and
 checks that the group is gone. Nothing is deleted by name prefix.
 
+Regular pricing is the default. Spot requires explicit
+`Bootstrap(..., priority="Spot", max_price=-1)` (or a nonnegative maximum
+price). Spot uses Azure's `Delete` eviction policy. The configured SKU, region
+and pricing model are never replaced with a fallback. Pass
+`record_bootstrap=callback` to persist `(group_name, ownership_token)` before
+each group-create request, for recovery if the caller is terminated.
+
 Mutating OpenTofu commands always use a throwaway host outside the managed
 fleet, so apply/destroy cannot delete their execution host. Cleanup failures
 are errors; if an operation already failed, cleanup is reported without
@@ -147,11 +160,21 @@ remove that exact group once access is restored.
 
 `Remote(azure).run(group, name, script)` is for non-sensitive scripts.
 `Remote(azure).sealed(...)` encrypts the payload to a fresh guest certificate
-before submitting it. Linux decrypts in a private `/run` directory; Windows
+before submitting it and encrypts stdout/stderr back to an invocation-scoped
+caller key. Linux decrypts in a private `/run` directory; Windows
 uses a restricted directory and a task-specific machine certificate. Guest
 keys and plaintext are removed after execution. Azure's retained agent scripts
-contain setup, ciphertext and cleanup commands, not the decrypted payload.
-Scripts must not print their own secrets or pass them to programs in argv.
+contain setup, ciphertext and cleanup commands, not decrypted input or output.
+Scripts must not pass secrets to programs in argv. Use `capture=True` when
+output contains secrets; it suppresses local printing as well.
+
+Sealed output is bounded to 8 MiB before JSON encoding and returned through
+fixed-size encrypted chunks with exact lengths. Retrieval iterates over the
+manifest's known length, never readiness polling. Truncated/missing chunks fail
+closed. Guest plaintext is removed before retrieval, and ciphertext is removed
+by caller cleanup. Azure permits only one action Run Command at a time per VM:
+concurrent requests can produce an explicit Azure conflict, never a substituted
+result. Each invocation has independent keys and directories.
 
 `VnetTofu` uses sealed transport for configuration, variables and state
 migration. Guest OpenTofu authenticates with managed identity, never the
@@ -169,11 +192,15 @@ are rejected rather than advertised as downloadable artifacts.
 
 Every call requires CLI success, ARM success and an exact, fresh completion
 line in stdout. A marker in stderr, a substring, a stale marker or a truncated
-response is a failure. Captured failures still print diagnostic output.
+response is a failure. Output frames also detect truncation that retains the
+completion line. Non-sensitive Run Command failures print diagnostic output.
+Sealed guest failures raise `RemoteExecutionError`; inspect its `returncode`,
+`stdout` and `stderr` privately. Its message does not print decrypted output.
 Successful capture returns stdout without Azure wrappers or the proof line.
 State pulls and raw/JSON show/output require `capture=True` so they are not
 printed to logs; the returned data still needs to be handled as sensitive.
-Run Command's output limit still applies; this is not a large-output transport.
+Unsealed output remains limited by Azure's response size. Sealed output uses
+bounded chunk retrieval; even small responses require additional CLI calls.
 
 ## Install a wheel without another credential
 
@@ -187,8 +214,8 @@ uv pip install --python /path/to/venv/bin/python dist/azvnet-0.1.0-py3-none-any.
 
 Consumers can pin a reviewed public Git commit or distribute this wheel with
 its SHA-256 digest. No GitHub PAT or deploy key is needed for public source.
-The consumer extraction uses a locked sibling checkout until publication; it
-does not claim that a release tag or registry distribution already exists.
+Consumers can validate this wheel before their pinned commit is public.
+Publishing source and validating a public install are separate release steps.
 
 ## Testing
 

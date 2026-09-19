@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import io
+import ipaddress
 import json
+import math
 from pathlib import Path
 import re
 import secrets
@@ -37,6 +39,37 @@ class Bootstrap:
     subnet: str
     image: str
     size: str
+    subnet_cidr: str | None = None
+    priority: str = "Regular"
+    max_price: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.subnet_cidr is not None:
+            ipaddress.ip_network(self.subnet_cidr)
+        if self.priority not in {"Regular", "Spot"}:
+            raise ValueError("bootstrap priority must be Regular or Spot")
+        if self.priority == "Spot" and (
+            self.max_price is None
+            or not math.isfinite(self.max_price)
+            or (self.max_price < 0 and self.max_price != -1)
+        ):
+            raise ValueError(
+                "Spot requires explicit max_price (-1 or a nonnegative price)"
+            )
+        if self.priority == "Regular" and self.max_price is not None:
+            raise ValueError("max_price is only valid for Spot")
+
+    def capacity_arguments(self) -> list[str]:
+        if self.priority == "Spot":
+            return [
+                "--priority",
+                "Spot",
+                "--eviction-policy",
+                "Delete",
+                "--max-price",
+                str(self.max_price),
+            ]
+        return ["--priority", "Regular"]
 
 
 def variable_values(environ: Mapping[str, str]) -> dict[str, object]:
@@ -189,6 +222,7 @@ class VnetTofu:
         cli_python: Path | None = None,
         config_files: Sequence[str] | None = None,
         environ: Mapping[str, str] | None = None,
+        record_bootstrap: Callable[[str, str], None] | None = None,
     ):
         if not re.fullmatch(r"[a-zA-Z0-9.-]+", state_endpoint):
             raise ValueError("state_endpoint must be a DNS hostname")
@@ -209,6 +243,7 @@ class VnetTofu:
         self.identity, self.workdir = identity, workdir
         self.state_group, self.state_vnet = state_group, state_vnet
         self.state_endpoint, self.bootstrap = state_endpoint, bootstrap
+        self.record_bootstrap = record_bootstrap
         self.hosts, self.tofu_version = tuple(hosts), tofu_version
         self.config_files = (
             tuple(config_files)
@@ -319,18 +354,40 @@ PY"""
         group, name = f"azvnet-{owner}", f"bootstrap-{owner[:24]}"
         if self.session.group_exists(group):
             raise AzvnetError("refusing to adopt a pre-existing bootstrap group")
-        subnet = self.session.json(
+        subnets = self.session.json(
             "network",
             "vnet",
             "subnet",
-            "show",
+            "list",
             "-g",
             self.state_group,
             "--vnet-name",
             self.state_vnet,
-            "-n",
-            self.bootstrap.subnet,
-        )["id"]
+        )
+        existing = next(
+            (item for item in subnets if item["name"] == self.bootstrap.subnet), None
+        )
+        if existing is None:
+            if self.bootstrap.subnet_cidr is None:
+                raise AzvnetError(
+                    "bootstrap subnet is absent and no subnet_cidr was configured"
+                )
+            existing = self.session.json(
+                "network",
+                "vnet",
+                "subnet",
+                "create",
+                "-g",
+                self.state_group,
+                "--vnet-name",
+                self.state_vnet,
+                "-n",
+                self.bootstrap.subnet,
+                "--address-prefixes",
+                self.bootstrap.subnet_cidr,
+            )
+            existing = existing.get("newSubnet", existing)
+        subnet = existing["id"]
 
         def cleanup() -> None:
             if not self.session.group_exists(group):
@@ -346,6 +403,8 @@ PY"""
 
         with cleanup_after(cleanup):
             print(f"azvnet task-owned bootstrap group: {group}", file=sys.stderr)
+            if self.record_bootstrap is not None:
+                self.record_bootstrap(group, owner)
             self.session.run(
                 "group",
                 "create",
@@ -375,6 +434,7 @@ PY"""
                 self.bootstrap.image,
                 "--size",
                 self.bootstrap.size,
+                *self.bootstrap.capacity_arguments(),
                 "--subnet",
                 subnet,
                 "--public-ip-address",
@@ -402,8 +462,17 @@ PY"""
                 vm["storageProfile"]["osDisk"]["osType"] != "Linux"
                 or vm.get("provisioningState") != "Succeeded"
                 or vm.get("tags", {}).get("azvnet-owner") != owner
+                or vm.get("priority", "Regular") != self.bootstrap.priority
             ):
                 raise AzvnetError("bootstrap ownership or suitability proof failed")
+            if (
+                self.bootstrap.priority == "Spot"
+                and vm.get("billingProfile", {}).get("maxPrice")
+                != self.bootstrap.max_price
+            ):
+                raise AzvnetError(
+                    "bootstrap Spot price differs from explicit configuration"
+                )
             self._attach(host)
             if not self._reachable(host):
                 raise AzvnetError(

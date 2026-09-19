@@ -12,14 +12,23 @@ import tarfile
 import tempfile
 import unittest
 
-from azvnet import AzureSession, AzvnetError, Identity, credentials, private_text
+from azvnet import (
+    AzureSession,
+    AzvnetError,
+    Bootstrap,
+    Identity,
+    credentials,
+    private_text,
+)
 from azvnet.auth import CLI_STDIN_PROGRAM, checked
 from azvnet.remote import (
+    MAX_OUTPUT_BYTES,
     cleanup_after,
     completion_script,
     encrypt_payload,
     linux_envelope,
     linux_key_setup,
+    decrypt_payload,
     parse_completion,
 )
 from azvnet.tofu import (
@@ -176,6 +185,13 @@ class CompletionTests(unittest.TestCase):
         result = parse_completion(arm_response(shell.stdout, shell.stderr), self.token)
         self.assertEqual(result, ("hello\n", "progress\n"))
 
+    def test_framed_capture_preserves_whitespace_and_literal_wrapper_text(self):
+        shell = self.shell("printf '\\n  [stdout]\\n[stderr]\\n\\n'")
+        self.assertEqual(
+            parse_completion(arm_response(shell.stdout, shell.stderr), self.token),
+            ("\n  [stdout]\n[stderr]\n\n", ""),
+        )
+
     def test_real_shell_failure_never_proves_success(self):
         for script in ("false", "false | cat", "echo failure >&2; exit 23"):
             with self.subTest(script=script):
@@ -239,6 +255,34 @@ class CleanupTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_explicit_bootstrap_capacity_and_subnet_configuration(self):
+        regular = Bootstrap(
+            "region", "subnet", "image", "size", subnet_cidr="10.0.1.0/24"
+        )
+        self.assertEqual(regular.capacity_arguments(), ["--priority", "Regular"])
+        spot = Bootstrap(
+            "region", "subnet", "image", "size", priority="Spot", max_price=-1
+        )
+        self.assertEqual(
+            spot.capacity_arguments(),
+            [
+                "--priority",
+                "Spot",
+                "--eviction-policy",
+                "Delete",
+                "--max-price",
+                "-1",
+            ],
+        )
+        for values in (
+            {"priority": "Spot"},
+            {"max_price": 1},
+            {"priority": "other"},
+            {"subnet_cidr": "invalid"},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                Bootstrap("region", "subnet", "image", "size", **values)
+
     def test_variable_serialization_preserves_structures(self):
         self.assertEqual(
             variable_values(
@@ -279,6 +323,80 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class ExecutableTests(unittest.TestCase):
+    def test_sealed_output_bound_fails_without_disclosing_output(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            guest, caller = root / "guest", root / "caller"
+            for directory in (guest, caller):
+                subprocess.run(
+                    ["bash", "-se"],
+                    input=linux_key_setup(str(directory)),
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+            payload = f"python3 -c 'print(\"x\" * {MAX_OUTPUT_BYTES})'"
+            ciphertext = encrypt_payload(
+                (guest / "cert.pem").read_text(), payload.encode()
+            )
+            result = subprocess.run(
+                ["bash"],
+                input=linux_envelope(
+                    str(guest),
+                    ciphertext,
+                    (caller / "cert.pem").read_text(),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("exceeds", result.stderr)
+            for name in ("key.pem", "payload.sh", "stdout", "stderr", "response.json"):
+                self.assertFalse((guest / name).exists())
+
+    def test_encrypted_output_and_guest_failure_diagnostics(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            guest, caller = root / "guest", root / "caller"
+            for directory in (guest, caller):
+                subprocess.run(
+                    ["bash", "-se"],
+                    input=linux_key_setup(str(directory)),
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+            canary = "synthetic-output-canary"
+            payload = f"echo {canary}; echo private-error >&2; exit 23"
+            encrypted = encrypt_payload(
+                (guest / "cert.pem").read_text(), payload.encode()
+            )
+            script = linux_envelope(
+                str(guest), encrypted, (caller / "cert.pem").read_text()
+            )
+            result = subprocess.run(
+                ["bash"], input=script, text=True, capture_output=True, check=True
+            )
+            self.assertNotIn(canary, result.stdout + result.stderr + script)
+            self.assertTrue(result.stdout.startswith("AZVNETOUTPUT "))
+            response = (guest / "response.b64").read_text()
+            self.assertEqual(len(response), int(result.stdout.split()[1]))
+            self.assertEqual(
+                decrypt_payload(caller, response),
+                (23, canary + "\n", "private-error\n"),
+            )
+            for name in (
+                "key.pem",
+                "cert.pem",
+                "payload.sh",
+                "stdout",
+                "stderr",
+                "response.json",
+            ):
+                self.assertFalse((guest / name).exists(), name)
+
     def test_actual_sealed_state_migration_and_serial_guard(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
