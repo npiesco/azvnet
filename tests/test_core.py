@@ -165,6 +165,61 @@ class CredentialsTests(unittest.TestCase):
 
 
 class CompletionTests(unittest.TestCase):
+    def test_windows_component_status_pair(self):
+        payload = base64.b64encode(
+            json.dumps({"stdout": "windows\r\n", "stderr": ""}).encode()
+        ).decode()
+        values = [
+            {
+                "code": "ComponentStatus/StdOut/succeeded",
+                "level": "Info",
+                "message": f"AZVNETSTREAM {payload}\n{self.token}",
+            },
+            {
+                "code": "ComponentStatus/StdErr/succeeded",
+                "level": "Info",
+                "message": "",
+            },
+        ]
+
+        def response(items):
+            return subprocess.CompletedProcess(
+                ["az"], 0, json.dumps({"value": items}), ""
+            )
+
+        self.assertEqual(
+            parse_completion(response(values), self.token), ("windows\r\n", "")
+        )
+        for malformed in (
+            values[:1],
+            values + values[:1],
+            [
+                values[0],
+                {**values[1], "code": "ComponentStatus/StdErr/failed"},
+            ],
+        ):
+            self.rejects(response(malformed))
+        self.rejects(
+            response(
+                [
+                    {**values[0], "message": "no proof"},
+                    {**values[1], "message": f"AZVNETSTREAM {payload}\n{self.token}"},
+                ]
+            )
+        )
+        self.rejects(
+            response(
+                [
+                    values[0],
+                    {
+                        "code": "ProvisioningState/succeeded",
+                        "level": "Info",
+                        "message": f"[stdout]\n{self.token}\n[stderr]\n",
+                    },
+                ]
+            )
+        )
+
     token = "AZVNETtestinvocation123"
 
     def shell(self, script):

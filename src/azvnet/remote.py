@@ -53,7 +53,7 @@ def completion_script(script: str, token: str, *, windows: bool = False) -> str:
         return (
             "$ErrorActionPreference = 'Stop'\n"
             "$global:LASTEXITCODE = 0\n"
-            "$transcript = Join-Path $env:TEMP ([Guid]::NewGuid().ToString('N'))\n"
+            "$transcript = Join-Path $env:TEMP ('azvnet-transcript-' + [Guid]::NewGuid().ToString('N'))\n"
             "New-Item -ItemType Directory -Path $transcript | Out-Null\n"
             "try {\n"
             "& {\n" + script + '\n} 1> "$transcript\\stdout" 2> "$transcript\\stderr"\n'
@@ -61,6 +61,12 @@ def completion_script(script: str, token: str, *, windows: bool = False) -> str:
             '$document = @{ stdout=[IO.File]::ReadAllText("$transcript\\stdout"); stderr=[IO.File]::ReadAllText("$transcript\\stderr") } | ConvertTo-Json -Compress\n'
             "Write-Output ('AZVNETSTREAM ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($document)))\n"
             f"Write-Output '{token}'\n"
+            "} catch {\n"
+            "  foreach ($stream in @('stdout','stderr')) {\n"
+            "    $path = Join-Path $transcript $stream\n"
+            "    if (Test-Path -LiteralPath $path) { [Console]::Error.Write([IO.File]::ReadAllText($path)) }\n"
+            "  }\n"
+            "  throw\n"
             "} finally { Remove-Item -LiteralPath $transcript -Recurse -Force }\n"
         )
     return (
@@ -106,24 +112,40 @@ def parse_completion(
         raise failure("missing ARM status")
     stdout = None
     stderr = ""
+    components: dict[str, str] = {}
     for value in values:
         if (
             not isinstance(value, dict)
             or not isinstance(value.get("code"), str)
             or not isinstance(value.get("level"), str)
-            or value["code"].lower() != "provisioningstate/succeeded"
             or value["level"].lower() != "info"
         ):
             raise failure("ARM operation did not succeed")
         message = value.get("message", "")
         if not isinstance(message, str):
             raise failure("invalid message")
+        code = value["code"].lower()
+        if code in {
+            "componentstatus/stdout/succeeded",
+            "componentstatus/stderr/succeeded",
+        }:
+            stream = code.split("/")[1]
+            if stdout is not None or stream in components:
+                raise failure("duplicate or mixed stream statuses")
+            components[stream] = message
+            continue
+        if code != "provisioningstate/succeeded" or components:
+            raise failure("ARM operation did not succeed or mixed stream statuses")
         if message.count("[stdout]") != 1 or message.count("[stderr]") != 1:
             raise failure("missing, truncated, or ambiguous stream wrappers")
         _, body = message.split("[stdout]", 1)
         if "[stderr]" not in body or stdout is not None:
             raise failure("ambiguous stdout")
         stdout, stderr = body.split("[stderr]", 1)
+    if components:
+        if set(components) != {"stdout", "stderr"}:
+            raise failure("missing component stream status")
+        stdout, stderr = components["stdout"], components["stderr"]
     if stdout is None:
         raise failure("missing stdout")
     lines = stdout.strip("\r\n").splitlines()
@@ -391,15 +413,27 @@ foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {{
   $acl.AddAccessRule($rule)
 }}
 Set-Acl -Path $d -AclObject $acl
-$cert = New-SelfSignedCertificate -Subject 'CN=azvnet-{nonce}' -CertStoreLocation Cert:\LocalMachine\My -KeyAlgorithm RSA -KeyLength 3072 -KeyUsage KeyEncipherment -Type DocumentEncryptionCert
+$cert = New-SelfSignedCertificate -Subject 'CN=azvnet-{nonce}' -CertStoreLocation Cert:\LocalMachine\My -Provider 'Microsoft Software Key Storage Provider' -KeyAlgorithm RSA -KeyLength 3072 -KeyUsage KeyEncipherment -Type DocumentEncryptionCert
 Set-Content -Path "$d\thumbprint" -Value $cert.Thumbprint
+$rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+try {{
+  $keyPath = Join-Path "$env:ProgramData\Microsoft\Crypto\Keys" $rsa.Key.UniqueName
+  if (-not (Test-Path -LiteralPath $keyPath)) {{ throw 'task certificate private key file not found' }}
+  Set-Content -LiteralPath "$d\private-key-path" -Value $keyPath
+}} finally {{ $rsa.Dispose() }}
 Write-Output '-----BEGIN CERTIFICATE-----'
 Write-Output ([Convert]::ToBase64String($cert.RawData))
 Write-Output '-----END CERTIFICATE-----'
 """
             cleanup = rf"""
 $d = '{directory}'
-Get-ChildItem Cert:\LocalMachine\My | Where-Object {{ $_.Subject -eq 'CN=azvnet-{nonce}' }} | Remove-Item -DeleteKey
+foreach ($cert in @(Get-ChildItem Cert:\LocalMachine\My | Where-Object {{ $_.Subject -eq 'CN=azvnet-{nonce}' }})) {{
+  Remove-Item -LiteralPath ("Cert:\LocalMachine\My\" + $cert.Thumbprint) -DeleteKey
+}}
+if (Test-Path -LiteralPath "$d\private-key-path") {{
+  $keyPath = (Get-Content -LiteralPath "$d\private-key-path").Trim()
+  if (Test-Path -LiteralPath $keyPath) {{ throw 'task certificate private key survived deletion' }}
+}}
 if (Test-Path $d) {{ Remove-Item -LiteralPath $d -Recurse -Force }}
 """
         else:

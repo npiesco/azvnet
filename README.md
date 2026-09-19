@@ -169,6 +169,8 @@ keys and plaintext are removed after execution. Azure's retained agent scripts
 contain setup, ciphertext and cleanup commands, not decrypted input or output.
 Scripts must not pass secrets to programs in argv. Use `capture=True` when
 output contains secrets; it suppresses local printing as well.
+Windows records the exact generated CNG key path and verifies it is absent
+after certificate deletion before removing the task directory.
 
 Sealed output is bounded to 8 MiB before JSON encoding and returned through
 fixed-size encrypted chunks with exact lengths. Retrieval iterates over the
@@ -196,6 +198,9 @@ Every call requires CLI success, ARM success and an exact, fresh completion
 line in stdout. A marker in stderr, a substring, a stale marker or a truncated
 response is a failure. Output frames also detect truncation that retains the
 completion line. Non-sensitive Run Command failures print diagnostic output.
+Both Azure response shapes are checked: Linux's wrapped message and Windows'
+separate successful stdout/stderr component statuses. Missing, duplicate or
+mixed component statuses fail closed.
 Sealed guest failures raise `RemoteExecutionError`; inspect its `returncode`,
 `stdout` and `stderr` privately. Its message does not print decrypted output.
 Successful capture returns stdout without Azure wrappers or the proof line.
@@ -237,3 +242,18 @@ Live acceptance additionally requires isolated SP login, private endpoint
 access, explicit-host identity attachment, bootstrap creation/deletion,
 failure-before-yield cleanup and Windows Run Command. Those operations need an
 authorized test subscription and are not part of the offline test command.
+
+For a dedicated Windows guest, supply `ARM_TENANT_ID`, `ARM_SUBSCRIPTION_ID`,
+`ARM_CLIENT_ID` and `ARM_CLIENT_SECRET` in the environment, then set `GROUP`
+and `VM` to the authorized target:
+
+```sh
+uv run python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase plain &&
+uv run python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase sealed
+```
+
+These commands exercise native/PowerShell failures, truncated framing,
+encrypted multi-chunk output and exact key/directory cleanup. The sealed phase
+also inspects retained Run Command files and process command lines for its
+synthetic canary (including base64 and UTF-16 encodings). It does not install
+software, register runners or change networking.
