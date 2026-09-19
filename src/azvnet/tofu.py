@@ -204,6 +204,23 @@ export TF_IN_AUTOMATION=1 TF_DATA_DIR="$work/.terraform"
     return script
 
 
+def endpoint_probe_script(endpoint: str) -> str:
+    return f"""python3 - <<'PY'
+import ipaddress, socket, ssl
+try:
+    addresses = socket.getaddrinfo({endpoint!r}, 443, type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(entry[4][0]).is_private for entry in addresses):
+        raise OSError("state endpoint does not resolve privately")
+    with socket.create_connection(({endpoint!r}, 443)) as connection:
+        with ssl.create_default_context().wrap_socket(connection, server_hostname={endpoint!r}):
+            pass
+except OSError:
+    print("unreachable")
+else:
+    print("reachable")
+PY"""
+
+
 class VnetTofu:
     """OpenTofu over Run Command with an explicit host or an owned bootstrap."""
 
@@ -264,22 +281,8 @@ class VnetTofu:
         self.session.close()
 
     def _reachable(self, host: Host) -> bool:
-        script = f"""python3 - <<'PY'
-import ipaddress, socket, ssl
-try:
-    addresses = socket.getaddrinfo({self.state_endpoint!r}, 443, type=socket.SOCK_STREAM)
-    if not addresses or any(not ipaddress.ip_address(entry[4][0]).is_private for entry in addresses):
-        raise OSError("state endpoint does not resolve privately")
-    with socket.create_connection(({self.state_endpoint!r}, 443), timeout=15) as connection:
-        with ssl.create_default_context().wrap_socket(connection, server_hostname={self.state_endpoint!r}):
-            pass
-except OSError:
-    print("unreachable")
-else:
-    print("reachable")
-PY"""
         result = self.remote.run(
-            host.group, host.name, script, capture=True
+            host.group, host.name, endpoint_probe_script(self.state_endpoint), capture=True
         ).stdout.strip()
         if result not in {"reachable", "unreachable"}:
             raise AzvnetError(

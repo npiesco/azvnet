@@ -136,6 +136,9 @@ search. A host must be a provisioned Linux VM, resolve the state endpoint
 privately and complete a TLS connection to it. A stopped configured host is
 started through a synchronous CLI operation. Identity attachment is checked.
 Backend authentication and permissions are then checked by `tofu init`.
+The private DNS/TCP/TLS probe waits for native completion without a phase
+deadline. Bound the whole job with an outer watchdog rather than treating a
+slow handshake as proof that a host cannot reach state.
 
 When no configured host reaches state, azvnet creates a uniquely named,
 ownership-tagged resource group containing a throwaway VM, NIC and disk, with
@@ -259,6 +262,9 @@ Tests execute installed Azure CLI without authentication, OpenTofu against
 provider-free configurations, Bash and OpenSSL. They do not replace executables
 or cloud calls with fake implementations. Parser tests use concrete ARM
 responses, including failed and truncated messages.
+The Linux TLS completion fixture also needs passwordless `sudo` to bind its
+dedicated loopback address on port 443; it uses generated test certificates
+and kernel channels, not an Azure endpoint.
 
 Live acceptance additionally requires isolated SP login, private endpoint
 access, explicit-host identity attachment, bootstrap creation/deletion,
