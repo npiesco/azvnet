@@ -279,6 +279,72 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class ExecutableTests(unittest.TestCase):
+    def test_actual_sealed_state_migration_and_serial_guard(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            source = root / "source"
+            source.mkdir()
+            (source / "main.tf").write_text(
+                'resource "terraform_data" "example" { input = "synthetic-state-canary" }\n'
+            )
+            checked(["tofu", "init", "-input=false"], cwd=source, capture=True)
+            checked(["tofu", "apply", "-auto-approve"], cwd=source, capture=True)
+            state = (source / "terraform.tfstate").read_bytes()
+            stale = json.loads(state)
+            self.assertGreater(stale["serial"], 0)
+            stale["serial"] -= 1
+            version = json.loads(
+                checked(["tofu", "version", "-json"], capture=True).stdout
+            )["terraform_version"]
+            script = guest_script(
+                bundle=configuration_bundle(source, ["main.tf"]),
+                arguments=["state", "push", "migrated.tfstate"],
+                variables={},
+                files={
+                    "migrated.tfstate": state,
+                    "stale.tfstate": json.dumps(stale).encode(),
+                },
+                tenant_id="tenant",
+                subscription_id="subscription",
+                identity=Identity("/identity", "client"),
+                tofu_version=version,
+            )
+            script += """
+tofu state list
+if tofu state push stale.tfstate >rejected.out 2>&1; then
+  echo 'stale state unexpectedly accepted' >&2
+  exit 1
+fi
+if ! grep -E 'cannot import state with serial [0-9]+ over newer state with serial [0-9]+' rejected.out >/dev/null; then
+  cat rejected.out >&2
+  exit 1
+fi
+echo 'serial guard passed'
+"""
+            guest = root / "guest"
+            setup = subprocess.run(
+                ["bash", "-se"],
+                input=linux_key_setup(str(guest)),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            encrypted = encrypt_payload(setup.stdout, script.encode())
+            transport = linux_envelope(str(guest), encrypted)
+            self.assertNotIn("synthetic-state-canary", transport)
+            result = subprocess.run(
+                ["bash"],
+                input=transport,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("terraform_data.example", result.stdout)
+            self.assertIn("serial guard passed", result.stdout)
+            self.assertNotIn("synthetic-state-canary", result.stdout + result.stderr)
+            self.assertFalse(guest.exists())
+
     def test_concurrent_guest_workdirs_are_distinct_and_removed(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
