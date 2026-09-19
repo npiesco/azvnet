@@ -219,8 +219,15 @@ mixed component statuses fail closed.
 Sealed guest failures raise `RemoteExecutionError`; inspect its `returncode`,
 `stdout` and `stderr` privately. Its message does not print decrypted output.
 Successful capture returns stdout without Azure wrappers or the proof line.
-State pulls and raw/JSON show/output require `capture=True` so they are not
-printed to logs; the returned data still needs to be handled as sensitive.
+State pulls, named outputs, raw/JSON show/output, `-show-sensitive` and
+`-json-into` require `capture=True`; returned data still needs to be handled
+as sensitive. The guard recognizes single/double-dash options and native
+boolean spellings such as `-json=true` and `--raw=1`. Plain redacted output
+listings and false boolean flags remain usable without capture (a named
+output still requires it). Local `-chdir=DIR` prefixes are checked before the
+verb; remote execution rejects that workstation path even with capture.
+Other global-prefix forms and unknown uncaptured output options are rejected
+before execution rather than bypassing the guard.
 Unsealed output remains limited by Azure's response size. Sealed output uses
 bounded chunk retrieval; even small responses require additional CLI calls.
 

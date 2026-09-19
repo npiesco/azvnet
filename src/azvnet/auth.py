@@ -21,16 +21,53 @@ class AzvnetError(RuntimeError):
 
 
 def require_capture(arguments: Sequence[str], capture: bool) -> None:
-    exports_state = list(arguments[:2]) == ["state", "pull"]
-    exports_values = (
-        bool(arguments)
-        and arguments[0] in {"show", "output"}
-        and any(flag in arguments for flag in ("-json", "-raw"))
-    )
-    if not capture and (exports_state or exports_values):
+    args = list(arguments)
+    while args and args[0].startswith("-chdir="):
+        args.pop(0)
+    if args and args[0].startswith("-"):
+        if len(args) == 1 and args[0] in {"-help", "--help", "-version", "--version"}:
+            return
+        raise AzvnetError(
+            "unsupported OpenTofu global arguments; put the verb first or use -chdir=DIR"
+        )
+    if capture or not args:
+        return
+
+    def reject() -> None:
         raise AzvnetError(
             "state/raw output can contain secrets; capture=True is required"
         )
+
+    if args[:2] == ["state", "pull"]:
+        reject()
+    verb, options = args[0], iter(args[1:])
+    for argument in options:
+        if argument == "--":
+            if verb == "output" and next(options, None) is not None:
+                reject()
+            break
+        if not argument.startswith("-"):
+            if verb == "output":
+                reject()
+            continue
+        name, equals, value = argument.lstrip("-").partition("=")
+        if name == "json-into":
+            # A destination can be /dev/stdout or /dev/stderr, not just a file.
+            reject()
+        sensitive_flag = name == "show-sensitive" or (
+            verb in {"show", "output"} and name in {"json", "raw"}
+        )
+        if sensitive_flag:
+            if not equals or value in {"1", "t", "T", "TRUE", "true", "True"}:
+                reject()
+            if value not in {"0", "f", "F", "FALSE", "false", "False"}:
+                raise AzvnetError(f"invalid boolean option: {name}")
+        elif verb == "output":
+            if name in {"state", "var", "var-file"}:
+                if not equals and next(options, None) is None:
+                    raise AzvnetError(f"missing value for output option: {name}")
+            elif name not in {"no-color", "help", "h"}:
+                raise AzvnetError(f"unsupported output option: {name}")
 
 
 def non_azure_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
