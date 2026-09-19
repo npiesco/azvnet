@@ -72,15 +72,9 @@ class Bootstrap:
         return ["--priority", "Regular"]
 
 
-def variable_values(environ: Mapping[str, str]) -> dict[str, object]:
-    values: dict[str, object] = {}
-    for key, value in environ.items():
-        if key.startswith("TF_VAR_"):
-            try:
-                values[key[7:]] = json.loads(value)
-            except json.JSONDecodeError:
-                values[key[7:]] = value
-    return values
+def tf_var_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """Keep raw variable text for OpenTofu's declared-type interpretation."""
+    return {key: value for key, value in environ.items() if key.startswith("TF_VAR_")}
 
 
 def configuration_bundle(workdir: Path, files: Sequence[str]) -> str:
@@ -161,7 +155,10 @@ def guest_script(
     subscription_id: str,
     identity: Identity,
     tofu_version: str,
+    tf_var_env: Mapping[str, str] | None = None,
 ) -> str:
+    if not arguments:
+        raise ValueError("an OpenTofu command is required")
     if not re.fullmatch(r"\d+\.\d+\.\d+", tofu_version):
         raise ValueError("tofu_version must be an exact x.y.z version")
     values = base64.b64encode(json.dumps(dict(variables)).encode()).decode()
@@ -191,13 +188,19 @@ export ARM_TENANT_ID={shlex.quote(tenant_id)}
 export ARM_SUBSCRIPTION_ID={shlex.quote(subscription_id)}
 export TF_IN_AUTOMATION=1 TF_DATA_DIR="$work/.terraform"
 """
+    for key, value in (tf_var_env or {}).items():
+        if not re.fullmatch(r"TF_VAR_[a-zA-Z_][a-zA-Z0-9_]*", key):
+            raise ValueError("tf_var_env keys must be TF_VAR_ shell identifiers")
+        if not isinstance(value, str) or "\0" in value:
+            raise ValueError("tf_var_env values must be strings without NUL bytes")
+        script += f"export {key}={shlex.quote(value)}\n"
     for name, content in files.items():
         if Path(name).name != name or name in {".", ".."}:
             raise ValueError("payload filenames must be basenames")
         script += f"printf %s {base64.b64encode(content).decode()} | base64 -d > {shlex.quote(name)}\n"
-    script += "tofu init -input=false -no-color >/dev/null\n"
     if arguments[0] != "init":
-        script += f"tofu {shlex.join(arguments)}\n"
+        script += "tofu init -input=false -no-color >/dev/null\n"
+    script += f"tofu {shlex.join(arguments)}\n"
     return script
 
 
@@ -484,6 +487,7 @@ PY"""
         self,
         *arguments: str,
         variables: Mapping[str, object] | None = None,
+        tf_var_env: Mapping[str, str] | None = None,
         capture: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         if not arguments:
@@ -494,6 +498,7 @@ PY"""
             bundle=configuration_bundle(self.workdir, self.config_files),
             arguments=args,
             variables=variables or {},
+            tf_var_env=tf_var_env,
             files=files,
             tenant_id=self.session.tenant_id,
             subscription_id=self.session.subscription_id,

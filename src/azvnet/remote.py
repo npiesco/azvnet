@@ -11,7 +11,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterator
 
-from .auth import AzureSession, AzvnetError
+from .auth import AzureSession, AzvnetError, non_azure_env
 
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 OUTPUT_CHUNK_SIZE = 2048
@@ -181,6 +181,7 @@ def encrypt_payload(certificate: str, payload: bytes) -> str:
                 str(cert),
             ],
             input=payload,
+            env=non_azure_env(),
             capture_output=True,
             check=True,
         )
@@ -264,6 +265,7 @@ def decrypt_payload(directory: Path, ciphertext: str) -> tuple[int, str, str]:
             str(directory / "key.pem"),
         ],
         input=base64.b64decode(ciphertext, validate=True),
+        env=non_azure_env(),
         capture_output=True,
         check=True,
     )
@@ -372,6 +374,7 @@ class Remote:
                     "-days",
                     "1",
                 ],
+                env=non_azure_env(),
                 capture_output=True,
                 check=True,
             )

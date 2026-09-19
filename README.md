@@ -187,7 +187,22 @@ default bundle includes only top-level `*.tf` and `.terraform.lock.hcl`.
 Pass `config_files=[...]` for additional templates or local module files.
 Symlink and out-of-tree members are rejected. JSON variable values retain their
 types, and explicit `-var-file` inputs are copied and renamed inside the guest.
-Inline `-var` arguments are rejected; use `variables={...}`.
+Inline `-var` arguments are rejected; use `variables={...}` for typed Python
+values, written as `azvnet.auto.tfvars.json`. For environment input, use
+`tf_var_env=tf_var_environment(os.environ)` (`import os`;
+`from azvnet import tf_var_environment`). Raw `TF_VAR_*` text stays in the guest
+environment so OpenTofu interprets it using the declared variable type.
+Environment values have lower precedence than automatic variable files;
+explicit `-var-file` inputs override both, in command-line order.
+
+Explicit `run("init", "-backend=false", ...)` preserves its init arguments.
+Other verbs receive a separate automatic `init -input=false -no-color` before
+execution. Unsupported remote file/control arguments fail before host selection.
+
+`non_azure_env(environ)` returns a copy without `ARM_*`, the credential-file
+setting or the private CLI cache path for non-Azure children. `checked` uses
+that filtered ambient environment by default; supplying `env` is explicit.
+Azure CLI and local OpenTofu receive their session's authentication environment.
 
 `migrate_state(Path(...))` transfers local state over the same sealed channel
 and performs a non-forced `tofu state push`. Serial/lineage conflicts remain

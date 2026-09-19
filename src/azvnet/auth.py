@@ -33,6 +33,16 @@ def require_capture(arguments: Sequence[str], capture: bool) -> None:
         )
 
 
+def non_azure_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Remove Azure authentication inputs from non-Azure child processes."""
+    return {
+        key: value
+        for key, value in (os.environ if environ is None else environ).items()
+        if not key.startswith("ARM_")
+        and key not in {"AZVNET_CREDENTIAL_FILE", "AZURE_CONFIG_DIR"}
+    }
+
+
 def checked(
     args: Sequence[str],
     *,
@@ -42,7 +52,7 @@ def checked(
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         args,
-        env=env,
+        env=non_azure_env() if env is None else env,
         cwd=cwd,
         text=True,
         capture_output=capture,

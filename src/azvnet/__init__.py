@@ -1,8 +1,8 @@
 """Explicit Azure authentication, checked remote execution, and private-VNet OpenTofu."""
 
-from .auth import AzureSession, AzvnetError, checked, credentials, private_text
+from .auth import AzureSession, AzvnetError, checked, credentials, non_azure_env, private_text
 from .remote import Remote, RemoteExecutionError
-from .tofu import Bootstrap, Host, Identity, VnetTofu, variable_values
+from .tofu import Bootstrap, Host, Identity, VnetTofu, tf_var_environment
 
 __all__ = [
     "AzureSession",
@@ -16,5 +16,6 @@ __all__ = [
     "checked",
     "credentials",
     "private_text",
-    "variable_values",
+    "non_azure_env",
+    "tf_var_environment",
 ]

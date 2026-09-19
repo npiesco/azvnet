@@ -36,7 +36,7 @@ from azvnet.tofu import (
     configuration_bundle,
     guest_script,
     remote_arguments,
-    variable_values,
+    tf_var_environment,
 )
 
 
@@ -340,9 +340,9 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 Bootstrap("region", "subnet", "image", "size", **values)
 
-    def test_variable_serialization_preserves_structures(self):
+    def test_environment_variable_text_is_not_reinterpreted(self):
         self.assertEqual(
-            variable_values(
+            tf_var_environment(
                 {
                     "TF_VAR_flag": "true",
                     "TF_VAR_values": '[1,"x"]',
@@ -351,7 +351,10 @@ class ConfigurationTests(unittest.TestCase):
                     "OTHER": "ignored",
                 }
             ),
-            {"flag": True, "values": [1, "x"], "object": {"a": 2}, "text": "text"},
+            {
+                "TF_VAR_flag": "true", "TF_VAR_values": '[1,"x"]',
+                "TF_VAR_object": '{"a":2}', "TF_VAR_text": "text",
+            },
         )
 
     def test_bundle_has_only_explicit_regular_members(self):
