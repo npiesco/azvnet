@@ -142,10 +142,19 @@ slow handshake as proof that a host cannot reach state.
 
 When no configured host reaches state, azvnet creates a uniquely named,
 ownership-tagged resource group containing a throwaway VM, NIC and disk, with
-no public IP. Its NIC uses your existing state subnet. Cleanup covers VM
+no public IP. Its NIC uses the configured state subnet. Cleanup covers VM
 creation, identity attachment, reachability, execution and failure before the
 host is yielded. Deletion requires the exact invocation's ownership tag and
 checks that the group is gone. Nothing is deleted by name prefix.
+
+If that subnet is missing, `subnet_cidr` authorizes creation with that exact
+prefix. Optional `Bootstrap(..., nat_gateway_id="/subscriptions/.../resourceGroups/.../providers/Microsoft.Network/natGateways/...")`
+attaches an existing NAT gateway and disables implicit default outbound access
+on the new subnet. The gateway must be provisioned in the configured
+subscription and VNet region. This input requires `subnet_cidr`; it never
+changes an existing subnet's NAT, route table or NSG. Without it, subnet
+creation retains Azure's default outbound settings. Configure egress to match
+your network policy; azvnet creates neither workload NSGs nor public VM IPs.
 
 Regular pricing is the default. Spot requires explicit
 `Bootstrap(..., priority="Spot", max_price=-1)` (or a nonnegative maximum

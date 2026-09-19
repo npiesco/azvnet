@@ -42,10 +42,22 @@ class Bootstrap:
     subnet_cidr: str | None = None
     priority: str = "Regular"
     max_price: float | None = None
+    nat_gateway_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.subnet_cidr is not None:
             ipaddress.ip_network(self.subnet_cidr)
+        if self.nat_gateway_id is not None:
+            if self.subnet_cidr is None:
+                raise ValueError("nat_gateway_id requires explicit subnet_cidr")
+            if not re.fullmatch(
+                r"/subscriptions/[^/\s?#]+/resourceGroups/[^/\s?#]+/providers/Microsoft\.Network/natGateways/[^/\s?#]+",
+                self.nat_gateway_id,
+                re.IGNORECASE,
+            ):
+                raise ValueError(
+                    "nat_gateway_id must be a full NAT gateway resource ID"
+                )
         if self.priority not in {"Regular", "Spot"}:
             raise ValueError("bootstrap priority must be Regular or Spot")
         if self.priority == "Spot" and (
@@ -70,6 +82,16 @@ class Bootstrap:
                 str(self.max_price),
             ]
         return ["--priority", "Regular"]
+
+    def subnet_arguments(self) -> list[str]:
+        if self.nat_gateway_id is None:
+            return []
+        return [
+            "--nat-gateway",
+            self.nat_gateway_id,
+            "--default-outbound-access",
+            "false",
+        ]
 
 
 def tf_var_environment(environ: Mapping[str, str]) -> dict[str, str]:
@@ -251,6 +273,11 @@ class VnetTofu:
             raise ValueError(
                 "managed identity must belong to the configured subscription"
             )
+        if (
+            bootstrap.nat_gateway_id is not None
+            and not bootstrap.nat_gateway_id.lower().startswith(prefix.lower())
+        ):
+            raise ValueError("NAT gateway must belong to the configured subscription")
         self.session = AzureSession(
             tenant_id=tenant_id,
             subscription_id=subscription_id,
@@ -282,7 +309,10 @@ class VnetTofu:
 
     def _reachable(self, host: Host) -> bool:
         result = self.remote.run(
-            host.group, host.name, endpoint_probe_script(self.state_endpoint), capture=True
+            host.group,
+            host.name,
+            endpoint_probe_script(self.state_endpoint),
+            capture=True,
         ).stdout.strip()
         if result not in {"reachable", "unreachable"}:
             raise AzvnetError(
@@ -378,6 +408,36 @@ class VnetTofu:
                 raise AzvnetError(
                     "bootstrap subnet is absent and no subnet_cidr was configured"
                 )
+            if self.bootstrap.nat_gateway_id is not None:
+                gateway = self.session.json(
+                    "network",
+                    "nat",
+                    "gateway",
+                    "show",
+                    "--ids",
+                    self.bootstrap.nat_gateway_id,
+                )
+                vnet = self.session.json(
+                    "network",
+                    "vnet",
+                    "show",
+                    "-g",
+                    self.state_group,
+                    "-n",
+                    self.state_vnet,
+                )
+                if (
+                    gateway.get("id", "").lower()
+                    != self.bootstrap.nat_gateway_id.lower()
+                    or gateway.get("provisioningState") != "Succeeded"
+                    or gateway.get("location", "").lower()
+                    != vnet.get("location", "").lower()
+                    or gateway.get("location", "").lower()
+                    != self.bootstrap.location.lower()
+                ):
+                    raise AzvnetError(
+                        "configured NAT gateway identity, region or provisioning proof failed"
+                    )
             existing = self.session.json(
                 "network",
                 "vnet",
@@ -391,8 +451,17 @@ class VnetTofu:
                 self.bootstrap.subnet,
                 "--address-prefixes",
                 self.bootstrap.subnet_cidr,
+                *self.bootstrap.subnet_arguments(),
             )
             existing = existing.get("newSubnet", existing)
+            if self.bootstrap.nat_gateway_id is not None and (
+                existing.get("natGateway", {}).get("id", "").lower()
+                != self.bootstrap.nat_gateway_id.lower()
+                or existing.get("defaultOutboundAccess") is not False
+            ):
+                raise AzvnetError(
+                    "created subnet did not retain explicit NAT/private-outbound configuration"
+                )
         subnet = existing["id"]
 
         def cleanup() -> None:
