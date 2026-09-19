@@ -91,6 +91,7 @@ class CredentialsTests(unittest.TestCase):
             environ=env,
         ) as session:
             self.assertEqual(session.env["ARM_USE_CLI"], "false")
+            self.assertEqual(session.env["AZURE_CORE_COLLECT_TELEMETRY"], "false")
             self.assertEqual(env, {"ARM_CLIENT_SECRET": "test-only-value"})
         self.assertEqual(dict(os.environ), original)
 

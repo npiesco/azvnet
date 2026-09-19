@@ -95,6 +95,8 @@ Login invokes that CLI over stdin so its secret never enters the OS command
 line. Each service-principal session owns a mode-0700 temporary Azure config
 directory and removes it on exit. It never changes global `os.environ` or
 calls `az account set`.
+CLI telemetry is disabled in that process environment so a background
+telemetry writer cannot recreate the removed config directory.
 On Linux, `TMPDIR=/dev/shm` keeps temporary credentials and transport keys in
 memory-backed storage (the caller must still close the session).
 

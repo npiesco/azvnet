@@ -163,6 +163,8 @@ class AzureSession:
             raise ValueError("tenant_id and subscription_id are required")
         self.tenant_id, self.subscription_id = tenant_id, subscription_id
         self.env = dict(os.environ if environ is None else environ)
+        # CLI telemetry can outlive the command and recreate a deleted config directory.
+        self.env["AZURE_CORE_COLLECT_TELEMETRY"] = "false"
         self.env.update(
             credentials(
                 tenant_id=tenant_id,
