@@ -9,12 +9,33 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
+import weakref
+from dataclasses import asdict
 from collections.abc import Callable, Iterator
 
 from .auth import AzureSession, AzvnetError, non_azure_env
+from .residue import CleanupResidue
 
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 OUTPUT_CHUNK_SIZE = 2048
+_LOCKS: weakref.WeakValueDictionary[tuple[str, str, str], threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
+_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def vm_operation(subscription: str, group: str, vm: str) -> Iterator[None]:
+    """Serialize this process's whole transactions, not just individual ARM actions."""
+    scope = (subscription.casefold(), group.casefold(), vm.casefold())
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(scope)
+        if lock is None:
+            lock = threading.RLock()
+            _LOCKS[scope] = lock
+    with lock:
+        yield
 
 
 class RemoteExecutionError(AzvnetError):
@@ -304,8 +325,14 @@ PY"""
 
 
 class Remote:
-    def __init__(self, session: AzureSession):
+    def __init__(
+        self,
+        session: AzureSession,
+        *,
+        record_cleanup: Callable[[CleanupResidue], object] | None = None,
+    ):
         self.session = session
+        self.record_cleanup = record_cleanup
 
     def run(
         self,
@@ -317,6 +344,18 @@ class Remote:
         capture: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Run a non-sensitive script. Use sealed() for secrets, state or configuration."""
+        with vm_operation(self.session.subscription_id, group, name):
+            return self._run(group, name, script, windows=windows, capture=capture)
+
+    def _run(
+        self,
+        group: str,
+        name: str,
+        script: str,
+        *,
+        windows: bool,
+        capture: bool,
+    ) -> subprocess.CompletedProcess[str]:
         token = "AZVNET" + secrets.token_hex(24)
         with tempfile.TemporaryDirectory(prefix="azvnet-command-") as scratch:
             path = Path(scratch) / ("command.ps1" if windows else "command.sh")
@@ -355,6 +394,20 @@ class Remote:
         capture: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Encrypt both script input and captured output with per-invocation keys."""
+        with vm_operation(self.session.subscription_id, group, name):
+            return self._sealed_result(
+                group, name, script, windows=windows, capture=capture
+            )
+
+    def _sealed_result(
+        self,
+        group: str,
+        name: str,
+        script: str,
+        *,
+        windows: bool,
+        capture: bool,
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(prefix="azvnet-output-") as scratch:
             caller = Path(scratch)
             subprocess.run(
@@ -378,16 +431,14 @@ class Remote:
                 capture_output=True,
                 check=True,
             )
-            encrypted = self._sealed(
+            output, errors = self._sealed(
                 group,
                 name,
                 script,
                 windows=windows,
                 output_certificate=(caller / "cert.pem").read_text(),
+                caller=caller,
             )
-            status, output, errors = decrypt_payload(caller, encrypted)
-        if status:
-            raise RemoteExecutionError(status, output, errors)
         if not capture:
             print(output, end="")
             print(errors, end="", file=sys.stderr)
@@ -401,7 +452,8 @@ class Remote:
         *,
         windows: bool,
         output_certificate: str,
-    ) -> str:
+        caller: Path,
+    ) -> tuple[str, str]:
         nonce = secrets.token_hex(24)
         if windows:
             directory = rf"C:\ProgramData\azvnet-{nonce}"
@@ -444,9 +496,36 @@ if (Test-Path $d) {{ Remove-Item -LiteralPath $d -Recurse -Force }}
             setup = linux_key_setup(directory)
             cleanup = f"rm -rf -- {shlex.quote(directory)}"
 
-        with cleanup_after(
-            lambda: self.run(group, name, cleanup, windows=windows, capture=True)
-        ):
+        residue = CleanupResidue(
+            self.session.subscription_id,
+            group,
+            name,
+            directory,
+            "Windows" if windows else "Linux",
+            nonce,
+            f"CN=azvnet-{nonce}" if windows else None,
+        )
+
+        def remove() -> None:
+            try:
+                self.run(group, name, cleanup, windows=windows, capture=True)
+            except Exception as error:
+                print(
+                    "Guest cleanup unconfirmed: " + json.dumps(asdict(residue)),
+                    file=sys.stderr,
+                )
+                if self.record_cleanup is not None:
+                    try:
+                        receipt = self.record_cleanup(residue)
+                        if receipt is not None:
+                            print(f"Guest cleanup receipt: {receipt}", file=sys.stderr)
+                    except Exception as record_error:
+                        message = f"Cleanup receipt write also failed: {record_error}"
+                        error.add_note(message)
+                        print(message, file=sys.stderr)
+                raise
+
+        with cleanup_after(remove):
             certificate = self.run(
                 group, name, setup, windows=windows, capture=True
             ).stdout
@@ -527,4 +606,7 @@ try {{
                 if len(chunk) != size:
                     raise AzvnetError("sealed output chunk was truncated")
                 chunks.append(chunk)
-            return "".join(chunks)
+            status, output, errors = decrypt_payload(caller, "".join(chunks))
+            if status:
+                raise RemoteExecutionError(status, output, errors)
+            return output, errors

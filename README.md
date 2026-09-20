@@ -188,9 +188,35 @@ Sealed output is bounded to 8 MiB before JSON encoding and returned through
 fixed-size encrypted chunks with exact lengths. Retrieval iterates over the
 manifest's known length, never readiness polling. Truncated/missing chunks fail
 closed. Guest plaintext is removed before retrieval, and ciphertext is removed
-by caller cleanup. Azure permits only one action Run Command at a time per VM:
-concurrent requests can produce an explicit Azure conflict, never a substituted
-result. Each invocation has independent keys and directories.
+by caller cleanup. Azure permits only one action Run Command at a time per VM.
+All `Remote` instances in one process share a re-entrant lock keyed by
+subscription/resource group/VM (case-insensitive). Sealed execution holds it
+through setup, execution, retrieval and cleanup; plain calls use the same lock.
+Different VMs remain independent. Other controllers can still occupy Azure's
+action slot and cause an explicit Conflict. There is no timed retry or backoff.
+Each invocation has independent keys and directories.
+
+For durable cleanup diagnostics, pass
+`record_cleanup=lambda residue: residue.write(Path(".local/run-command-residue"))`
+to `Remote` or `VnetTofu` (`Path` is from `pathlib`). If automatic cleanup fails,
+the callback receives a `CleanupResidue`: subscription, group, VM, invocation
+directory/token, OS and Windows certificate subject when applicable. It contains
+no payload, output, key bytes or credential. `write()` publishes/fsyncs a
+current-user-owned mode-0600 record in a mode-0700 directory without replacing
+other records. Cleanup and record-write failures stay visible without replacing
+an earlier execution error. Without a callback, nonsecret metadata is reported
+to stderr but is not durably stored.
+
+A receipt means **cleanup is unconfirmed**, not that a private key necessarily
+remains. Before recovery, the owner must establish that the original invocation
+and any competing Run Command have completed, then verify the exact
+subscription/group/VM and invocation path. Remove only that inactive directory.
+On Windows also match the recorded certificate subject in
+`Cert:\LocalMachine\My`, remove that exact certificate with `-DeleteKey`, and
+verify the generated key path recorded in the invocation directory is absent
+before deleting the directory. Do not remove active work or enumerate/delete
+other invocation directories by prefix. Verify absence and retain the receipt
+with the recovery result; azvnet does not perform automatic orphan recovery.
 
 `VnetTofu` uses sealed transport for configuration, variables and state
 migration. Guest OpenTofu authenticates with managed identity, never the

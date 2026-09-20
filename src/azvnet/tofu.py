@@ -19,6 +19,7 @@ import tempfile
 
 from .auth import AzureSession, AzvnetError, checked, require_capture
 from .remote import Remote, cleanup_after
+from .residue import CleanupResidue
 
 
 @dataclass(frozen=True)
@@ -265,6 +266,7 @@ class VnetTofu:
         config_files: Sequence[str] | None = None,
         environ: Mapping[str, str] | None = None,
         record_bootstrap: Callable[[str, str], None] | None = None,
+        record_cleanup: Callable[[CleanupResidue], object] | None = None,
     ):
         if not re.fullmatch(r"[a-zA-Z0-9.-]+", state_endpoint):
             raise ValueError("state_endpoint must be a DNS hostname")
@@ -286,7 +288,7 @@ class VnetTofu:
             cli_python=cli_python,
             environ=environ,
         )
-        self.remote = Remote(self.session)
+        self.remote = Remote(self.session, record_cleanup=record_cleanup)
         self.identity, self.workdir = identity, workdir
         self.state_group, self.state_vnet = state_group, state_vnet
         self.state_endpoint, self.bootstrap = state_endpoint, bootstrap
