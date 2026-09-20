@@ -1,43 +1,88 @@
 # azvnet
 
-Your OpenTofu state can sit behind an Azure private endpoint while your terminal
-has no route into its VNet. Destroying the last VM should not leave you unable
-to create the next one.
+You have your infrastructure repo and Azure credential, but your OpenTofu
+backend only accepts connections from a private VNet. Delete the last VM
+inside it and your terminal still has no route to state.
 
-**azvnet runs OpenTofu inside the VNet, through Azure Run Command.**
+**azvnet runs OpenTofu where your state is reachable.**
 
-From a checkout, install the package and its validation tools:
-
-```sh
-uv sync --locked
-```
-
-With infrastructure in `infra/` and the configuration below saved as
-`azvnet.json`:
+Save this as `plan.py` (configuration and authentication follow):
 
 ```python
 import json
 from pathlib import Path
 
-from azvnet import Bootstrap, Host, Identity, VnetTofu
+from azvnet import Bootstrap, Identity, VnetTofu
 
-config = json.loads(Path("azvnet.json").read_text())
-identity = Identity(**config.pop("identity"))
-bootstrap = Bootstrap(**config.pop("bootstrap"))
-hosts = [Host(**host) for host in config.pop("hosts")]
+settings = json.loads(Path("azvnet.json").read_text())
+settings["identity"] = Identity(**settings["identity"])
+settings["bootstrap"] = Bootstrap(**settings["bootstrap"])
 
-with VnetTofu(
-    **config,
-    identity=identity,
-    bootstrap=bootstrap,
-    hosts=hosts,
-    workdir=Path("infra"),
-) as tofu:
-    tofu.run("plan", "-input=false", variables={"enabled": True})
+with VnetTofu(workdir=Path("infra"), **settings) as tofu:
+    tofu.run("plan", "-input=false")
 ```
 
-The configuration is explicit. Replace every placeholder with your own
-deployment values; `enabled` must be an input declared by that configuration.
+With no existing hosts configured, that creates a temporary Linux VM in your
+VNet, runs OpenTofu using managed identity, checks the guest result, then
+deletes the temporary resource group.
+
+You still need the state backend, VNet, private DNS, outbound access and an
+authorized user-assigned managed identity. The controller's service principal
+must be allowed to create the temporary resources, attach that identity and
+invoke Run Command. azvnet does not grant those permissions.
+
+## Quick Start
+
+### 1. Install
+
+The controller needs Python 3.12+, uv, Git, Azure CLI, OpenSSL and `ssh-keygen`.
+The Linux guest needs Bash, Python 3, OpenSSL, curl and tar.
+
+Install the public source pin used by the consumers:
+
+```sh
+uv venv --python 3.12 &&
+uv pip install --python .venv/bin/python \
+  "azvnet @ git+https://github.com/npiesco/azvnet.git@8e88dcf9eb130cd473e15a71a93093d575534686"
+```
+
+There are no runtime Python dependencies. Installing the package needs no
+GitHub PAT, deploy key or checkout of a consumer repository.
+
+### 2. Supply the Azure credential
+
+Inject `ARM_CLIENT_SECRET` through your runtime environment or secret manager.
+Keep its value out of source, shell arguments and infrastructure configuration.
+
+Set `AZVNET_CLI_PYTHON` to the Python interpreter containing your installed
+`azure.cli` module. For Microsoft's Debian package:
+
+```sh
+export AZVNET_CLI_PYTHON=/opt/az/bin/python3
+```
+
+Tenant, subscription and client IDs come from the configuration below.
+Conflicting `ARM_*` values are rejected.
+
+An explicit `credential_file=Path(...)` is also supported. It must be owned
+by the current user, nonsymlink and mode 0600, with these labelled fields:
+
+```text
+Tenant: <tenant UUID>
+Client ID: <service-principal application UUID>
+Secret: <runtime secret>
+```
+
+No credential filename is assumed. Do not commit that file.
+
+### 3. Configure the VNet and run the plan
+
+Put your OpenTofu root in `infra/`, including its `.tf` files and
+`.terraform.lock.hcl`. Its backend must already describe your state storage.
+
+Save the following as `azvnet.json`, replacing every placeholder. The identity
+resource ID and client ID must identify the same user-assigned identity in the
+configured subscription. Choose a VM size available in your VNet's region.
 
 ```json
 {
@@ -48,64 +93,46 @@ deployment values; `enabled` must be an input declared by that configuration.
     "resource_id": "/subscriptions/<subscription UUID>/resourceGroups/<identity group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<identity name>",
     "client_id": "<managed-identity application UUID>"
   },
-  "state_group": "<group containing the state VNet>",
-  "state_vnet": "<state VNet name>",
+  "state_group": "<resource group containing the state VNet>",
+  "state_vnet": "<VNet name>",
   "state_endpoint": "<storage account>.blob.core.windows.net",
   "bootstrap": {
-    "location": "<state VNet region>",
-    "subnet": "<subnet in the state VNet>",
+    "location": "<VNet region>",
+    "subnet": "<existing subnet name>",
     "image": "Ubuntu2404",
     "size": "<permitted Linux VM size>"
   },
-  "tofu_version": "1.10.6",
-  "hosts": []
+  "tofu_version": "1.10.6"
 }
 ```
 
-You still need Python 3.12+, Azure CLI, OpenSSL and `ssh-keygen` locally.
-Guests need Bash, Python 3, OpenSSL, curl and tar. State storage, private DNS,
-the VNet, outbound access and a user-assigned managed identity with
-provider/backend permissions must already exist. The service principal needs
-Run Command, VM/identity-attachment and task-resource-group create/delete
-permissions. azvnet does not grant roles or build your persistent VNet.
-The subnet must exist unless `Bootstrap(subnet_cidr="...")` explicitly permits
-on-demand creation. Subnets are enumerated with a checked request first;
-authentication failures cannot be mistaken for absence. Existing subnets and
-their NSG/NAT associations are left unchanged.
+Run the `plan.py` example from the directory containing those files:
 
-## Authenticate without changing your CLI context
-
-Supply `ARM_CLIENT_SECRET` through your process environment. Tenant,
-subscription and client come from constructor arguments; conflicting `ARM_*`
-values are rejected. Alternatively, pass `credential_file=Path(...)` pointing
-to a current-user-owned, non-symlink, mode-0600 file:
-
-```text
-Tenant: <tenant UUID>
-Client ID: <application UUID>
-Secret: <runtime secret>
+```sh
+.venv/bin/python plan.py
 ```
 
-No credential filename is assumed. Do not commit this file.
+**The point:** the controller talks to Azure's control plane. OpenTofu talks
+to private state from inside the VNet. The service-principal secret stays on
+the controller; the guest uses managed identity.
 
-Set `AZVNET_CLI_PYTHON` to the interpreter containing your installed
-`azure.cli` module (for the Microsoft Debian package, typically
-`/opt/az/bin/python3`). You can instead pass `cli_python=Path(...)`.
-Login invokes that CLI over stdin so its secret never enters the OS command
-line. Each service-principal session owns a mode-0700 temporary Azure config
-directory and removes it on exit. It never changes global `os.environ` or
-calls `az account set`.
-Concurrent first-use calls on one session share an authentication lock through
-login and identity verification; authenticated commands remain parallel.
-Close the session only after its callers have completed.
-CLI telemetry is disabled in that process environment so a background
-telemetry writer cannot recreate the removed config directory.
-On Linux, `TMPDIR=/dev/shm` keeps temporary credentials and transport keys in
-memory-backed storage (the caller must still close the session).
+## What you can use independently
+
+| API | What it handles |
+| --- | --- |
+| `AzureSession` | Explicit Azure identity, checked CLI calls and local OpenTofu |
+| `Remote` | Guest execution with checked completion; encrypted input/output when needed |
+| `VnetTofu` | Configuration transfer, private-VNet OpenTofu and temporary-host cleanup |
+
+For project creation/cloning, coding agents, isolated worktrees and self-hosted
+GitHub Actions, use [`tnb-runner`](https://github.com/npiesco/tnb-runner).
+Those are consumer responsibilities. azvnet does not know your repository,
+runner labels, build commands or fleet layout.
 
 ## Keep local state local
 
-`AzureSession` works independently of private-VNet configuration:
+You do not need private-VNet configuration to use the Azure wrapper. This
+example expects a local backend in `infra/` and the named environment variables:
 
 ```python
 import os
@@ -127,202 +154,153 @@ with AzureSession(
     azure.local_tofu("plan", "-input=false", workdir=Path("infra"))
 ```
 
-This example assumes a `backend "local"` configuration. With no SP secret or
-credential file, `interactive=True` validates a cached user account for the
-specified tenant/subscription. It does not switch the default account.
-Service-principal authentication takes precedence when supplied.
+Local execution also needs OpenTofu on the controller. With no SP credential,
+`interactive=True` checks an existing cached user login for the selected
+tenant/subscription. It does not start an interactive login or switch accounts.
 
-## Select a host without adopting somebody else's VM
+SP login arguments travel over stdin. Each session owns a private Azure CLI
+cache, disables CLI telemetry and removes its cache on close. Concurrent first
+use is serialized; authenticated commands can run in parallel. Close the
+session after its callers finish.
 
-`hosts=[Host(group="...", name="...")]` is an explicit allowlist, not a fleet
-search. A host must be a provisioned Linux VM, resolve the state endpoint
-privately and complete a TLS connection to it. A stopped configured host is
-started through a synchronous CLI operation. Identity attachment is checked.
-Backend authentication and permissions are then checked by `tofu init`.
-The private DNS/TCP/TLS probe waits for native completion without a phase
-deadline. Bound the whole job with an outer watchdog rather than treating a
-slow handshake as proof that a host cannot reach state.
+## Choose where OpenTofu runs
 
-When no configured host reaches state, azvnet creates a uniquely named,
-ownership-tagged resource group containing a throwaway VM, NIC and disk, with
-no public IP. Its NIC uses the configured state subnet. Cleanup covers VM
-creation, identity attachment, reachability, execution and failure before the
-host is yielded. Deletion requires the exact invocation's ownership tag and
-checks that the group is gone. Nothing is deleted by name prefix.
+Pass `hosts=[Host(group="...", name="...")]` to allow existing hosts
+(`Host` is exported by `azvnet`). This is an explicit list, not fleet discovery.
+A host must be a provisioned Linux VM with private DNS and TLS connectivity
+to the state endpoint. A stopped configured host is started; managed-identity
+attachment is checked. `tofu init` checks backend access.
 
-If that subnet is missing, `subnet_cidr` authorizes creation with that exact
-prefix. Optional `Bootstrap(..., nat_gateway_id="/subscriptions/.../resourceGroups/.../providers/Microsoft.Network/natGateways/...")`
-attaches an existing NAT gateway and disables implicit default outbound access
-on the new subnet. The gateway must be provisioned in the configured
-subscription and VNet region. This input requires `subnet_cidr`; it never
-changes an existing subnet's NAT, route table or NSG. Without it, subnet
-creation retains Azure's default outbound settings. Configure egress to match
-your network policy; azvnet creates neither workload NSGs nor public VM IPs.
+When no configured host can be used, azvnet creates an ownership-tagged group
+for a temporary VM, NIC and disk. The VM has no public IP. Mutating OpenTofu
+commands use a disposable host outside the managed fleet, so apply/destroy
+cannot delete their own execution host.
 
-Regular pricing is the default. Spot requires explicit
-`Bootstrap(..., priority="Spot", max_price=-1)` (or a nonnegative maximum
-price). Spot uses Azure's `Delete` eviction policy. The configured SKU, region
-and pricing model are never replaced with a fallback. Pass
-`record_bootstrap=callback` to persist `(group_name, ownership_token)` before
-each group-create request, for recovery if the caller is terminated.
+| Bootstrap input | What you authorize |
+| --- | --- |
+| `subnet` | Use that subnet in the configured VNet |
+| `subnet_cidr` | Create the subnet if missing, with that exact prefix |
+| `nat_gateway_id` | Attach an existing, same-subscription/region NAT gateway when creating that subnet; requires `subnet_cidr` |
+| `priority="Spot", max_price=-1` | Use Spot at the on-demand price ceiling; a nonnegative maximum price is also accepted |
+| `record_bootstrap=callback` on `VnetTofu` | Record `(group_name, ownership_token)` before resource-group creation |
 
-Mutating OpenTofu commands always use a throwaway host outside the managed
-fleet, so apply/destroy cannot delete their execution host. Cleanup failures
-are errors; if an operation already failed, cleanup is reported without
-replacing the primary exception. An unavailable Azure control plane can still
-prevent deletion: inspect the reported group, verify its ownership tag, and
-remove that exact group once access is restored.
+Regular capacity is the default. Spot uses Azure's `Delete` eviction policy.
+azvnet does not substitute another region, SKU or pricing mode.
 
-## What crosses Run Command
+Existing subnet/NAT/NSG settings are left alone. A newly created subnet with
+`nat_gateway_id` has implicit outbound access disabled; without that input,
+Azure's default outbound settings apply. Supply egress appropriate to your
+network policy.
 
-`Remote(azure).run(group, name, script)` is for non-sensitive scripts.
-`Remote(azure).sealed(...)` encrypts the payload to a fresh guest certificate
-before submitting it and encrypts stdout/stderr back to an invocation-scoped
-caller key. Linux decrypts in a private `/run` directory; Windows
-uses a restricted directory and a task-specific machine certificate. Guest
-keys and plaintext are removed after execution. Azure's retained agent scripts
-contain setup, ciphertext and cleanup commands, not decrypted input or output.
-Scripts must not pass secrets to programs in argv. Use `capture=True` when
-output contains secrets; it suppresses local printing as well.
-Windows records the exact generated CNG key path and verifies it is absent
-after certificate deletion before removing the task directory.
+Cleanup covers failures during creation, identity attachment and execution.
+Deletion checks the exact invocation's ownership tag and confirms group
+absence. A control-plane outage can still prevent cleanup; the reported group
+and ownership token are the recovery boundary, not a name prefix.
 
-Sealed output is bounded to 8 MiB before JSON encoding and returned through
-fixed-size encrypted chunks with exact lengths. Retrieval iterates over the
-manifest's known length, never readiness polling. Truncated/missing chunks fail
-closed. Guest plaintext is removed before retrieval, and ciphertext is removed
-by caller cleanup. Azure permits only one action Run Command at a time per VM.
-All `Remote` instances in one process share a re-entrant lock keyed by
-subscription/resource group/VM (case-insensitive). Sealed execution holds it
-through setup, execution, retrieval and cleanup; plain calls use the same lock.
-Different VMs remain independent. Other controllers can still occupy Azure's
-action slot and cause an explicit Conflict. There is no timed retry or backoff.
-Each invocation has independent keys and directories.
+## Send configuration and variables
 
-For durable cleanup diagnostics, pass
-`record_cleanup=lambda residue: residue.write(Path(".local/run-command-residue"))`
-to `Remote` or `VnetTofu` (`Path` is from `pathlib`). If automatic cleanup fails,
-the callback receives a `CleanupResidue`: subscription, group, VM, invocation
-directory/token, OS and Windows certificate subject when applicable. It contains
-no payload, output, key bytes or credential. `write()` publishes/fsyncs a
-current-user-owned mode-0600 record in a mode-0700 directory without replacing
-other records. Cleanup and record-write failures stay visible without replacing
-an earlier execution error. Without a callback, nonsecret metadata is reported
-to stderr but is not durably stored.
+The default bundle contains top-level `*.tf` files and `.terraform.lock.hcl`.
+Use `config_files=[...]` for templates or local modules. Symlinks and paths
+outside the work directory are rejected.
 
-A receipt means **cleanup is unconfirmed**, not that a private key necessarily
-remains. Before recovery, the owner must establish that the original invocation
-and any competing Run Command have completed, then verify the exact
-subscription/group/VM and invocation path. Remove only that inactive directory.
-On Windows also match the recorded certificate subject in
-`Cert:\LocalMachine\My`, remove that exact certificate with `-DeleteKey`, and
-verify the generated key path recorded in the invocation directory is absent
-before deleting the directory. Do not remove active work or enumerate/delete
-other invocation directories by prefix. Verify absence and retain the receipt
-with the recovery result; azvnet does not perform automatic orphan recovery.
+| Input | How it reaches OpenTofu |
+| --- | --- |
+| `variables={"enabled": True}` | Typed JSON in a guest-side automatic variable file |
+| `tf_var_env=tf_var_environment(os.environ)` | Raw `TF_VAR_*` strings, interpreted using declared OpenTofu types |
+| `-var-file=PATH` | Copied into the guest; explicit files override automatic files/environment in command-line order |
+| Inline `-var` | Rejected; use the typed-variable input |
+| `migrate_state(Path(...))` | Encrypted transfer followed by non-forced `tofu state push`; lineage/serial conflicts remain errors |
 
-`VnetTofu` uses sealed transport for configuration, variables and state
-migration. Guest OpenTofu authenticates with managed identity, never the
-service-principal secret. Each invocation has a private work directory; the
-default bundle includes only top-level `*.tf` and `.terraform.lock.hcl`.
-Pass `config_files=[...]` for additional templates or local module files.
-Symlink and out-of-tree members are rejected. JSON variable values retain their
-types, and explicit `-var-file` inputs are copied and renamed inside the guest.
-Inline `-var` arguments are rejected; use `variables={...}` for typed Python
-values, written as `azvnet.auto.tfvars.json`. For environment input, use
-`tf_var_env=tf_var_environment(os.environ)` (`import os`;
-`from azvnet import tf_var_environment`). Raw `TF_VAR_*` text stays in the guest
-environment so OpenTofu interprets it using the declared variable type.
-Environment values have lower precedence than automatic variable files;
-explicit `-var-file` inputs override both, in command-line order.
+`tf_var_environment` is exported by `azvnet`; its argument is the caller's
+environment mapping. Every supplied variable must exist in your configuration.
 
-Explicit `run("init", "-backend=false", ...)` preserves its init arguments.
-Other verbs receive a separate automatic `init -input=false -no-color` before
-execution. Unsupported remote file/control arguments fail before host selection.
+An explicit `run("init", ...)` keeps its init arguments. Other verbs receive
+an automatic `init -input=false -no-color` first. Remote plan files are
+ephemeral: `-out`, workstation state paths and unsupported remote file/control
+arguments fail rather than imply an artifact you can retrieve later.
 
-`non_azure_env(environ)` returns a copy without `ARM_*`, the credential-file
-setting or the private CLI cache path for non-Azure children. `checked` uses
-that filtered ambient environment by default; supplying `env` is explicit.
-Azure CLI and local OpenTofu receive their session's authentication environment.
+## Know whether the guest succeeded
 
-`migrate_state(Path(...))` transfers local state over the same sealed channel
-and performs a non-forced `tofu state push`. Serial/lineage conflicts remain
-errors. Remote plan files are ephemeral, so `-out` and workstation state paths
-are rejected rather than advertised as downloadable artifacts.
+Azure CLI exit zero is not enough. Calls require CLI success, ARM success and
+one fresh, exact completion line in stdout. Stale, duplicate, missing or
+truncated proofs fail. Linux's wrapped response and Windows' separate stream
+statuses are checked.
 
-Every call requires CLI success, ARM success and an exact, fresh completion
-line in stdout. A marker in stderr, a substring, a stale marker or a truncated
-response is a failure. Output frames also detect truncation that retains the
-completion line. Non-sensitive Run Command failures print diagnostic output.
-Both Azure response shapes are checked: Linux's wrapped message and Windows'
-separate successful stdout/stderr component statuses. Missing, duplicate or
-mixed component statuses fail closed.
-Sealed guest failures raise `RemoteExecutionError`; inspect its `returncode`,
-`stdout` and `stderr` privately. Its message does not print decrypted output.
-For checked local processes, failed captured stdout remains only in the
-exception's `stdout` attribute; stderr diagnostics are still reported.
-Successful capture returns stdout without Azure wrappers or the proof line.
+`Remote.run()` is for non-sensitive scripts. `Remote.sealed()` encrypts input
+and output with invocation-specific keys. Linux uses a private `/run`
+directory; Windows uses a restricted directory and machine certificate.
+Retained Azure agent scripts contain ciphertext/setup/cleanup, not decrypted
+input or output. Your script must still avoid passing secrets in child argv.
+
+> **Capture is still required.** Use `capture=True` for sensitive output.
+> `RemoteExecutionError` exposes `returncode`, `stdout` and `stderr` without
+> putting decrypted output in its message. Handle those attributes privately.
+
 State pulls, named outputs, raw/JSON show/output, `-show-sensitive` and
-`-json-into` require `capture=True`; returned data still needs to be handled
-as sensitive. The guard recognizes single/double-dash options and native
-boolean spellings such as `-json=true` and `--raw=1`. Plain redacted output
-listings and false boolean flags remain usable without capture (a named
-output still requires it). Local `-chdir=DIR` prefixes are checked before the
-verb; remote execution rejects that workstation path even with capture.
-Other global-prefix forms and unknown uncaptured output options are rejected
-before execution rather than bypassing the guard.
-Unsealed output remains limited by Azure's response size. Sealed output uses
-bounded chunk retrieval; even small responses require additional CLI calls.
+`-json-into` require capture. Plain redacted listings remain usable without it.
+Failed captured local stdout stays in the exception; stderr remains diagnostic.
+Successful capture strips Azure wrappers and the completion proof.
 
-## Install a wheel without another credential
+Sealed output is limited to 8 MiB before JSON encoding. Encrypted chunks have
+checked lengths; missing/truncated data is an error. Per-VM locks serialize
+transactions within one process. Other controllers can still occupy Azure's
+single Run Command slot and cause a Conflict; there is no timed retry.
+Readiness uses native completion, with an outer job watchdog if a bound is needed.
 
-The package has no runtime Python dependencies and no dependency on a consumer
-repository. Build a wheel from the checkout:
+## Recover an interrupted cleanup
 
-```sh
-uv build --out-dir dist &&
-uv pip install --python /path/to/venv/bin/python dist/azvnet-0.1.0-py3-none-any.whl
+Pass `record_cleanup` to `Remote` or `VnetTofu` to retain nonsecret recovery
+metadata. For example, this callback writes a private, durable receipt:
+
+```python
+from pathlib import Path
+
+from azvnet import CleanupResidue
+
+def record_cleanup(residue: CleanupResidue) -> Path:
+    return residue.write(Path(".local/run-command-residue"))
 ```
 
-Consumers can pin a reviewed public Git commit or distribute this wheel with
-its SHA-256 digest. The public Git dependency path requires Git locally.
-No GitHub PAT or deploy key is needed for public source.
-Consumers can validate this wheel before their pinned commit is public.
-Publishing source and validating a public install are separate release steps.
+Receipts contain the exact subscription/group/VM, invocation directory/token,
+OS and Windows certificate subject where applicable. They contain no payload,
+output, key bytes or credential. Files are owned mode 0600 in a mode-0700
+directory. Without a callback, diagnostics go to stderr without durable storage.
+
+A receipt means cleanup is **unconfirmed**, not that a key definitely remains.
+Establish that the original and any competing Run Command have finished before
+touching the recorded path. Remove only that inactive invocation directory.
+For Windows, also match the recorded certificate subject, remove that exact
+certificate with `-DeleteKey`, and confirm the recorded CNG key path is absent.
+Retain the receipt and recovery result. Do not delete by directory/name prefix.
+
+Cleanup and receipt-write failures stay visible without replacing the original
+execution failure. azvnet does not automatically recover abandoned invocations.
 
 ## Testing
 
+From an azvnet checkout:
+
 ```sh
 uv sync --locked &&
-uv run ruff check src tests &&
-uv run mypy src &&
-AZVNET_CLI_PYTHON=/opt/az/bin/python3 uv run python -m unittest discover -s tests -v
+uv run --locked ruff check src tests &&
+uv run --locked mypy src &&
+AZVNET_CLI_PYTHON=/opt/az/bin/python3 \
+  uv run --locked python -m unittest discover -s tests -v
 ```
 
-Tests execute installed Azure CLI without authentication, OpenTofu against
-provider-free configurations, Bash and OpenSSL. They do not replace executables
-or cloud calls with fake implementations. Parser tests use concrete ARM
-responses, including failed and truncated messages.
-The Linux TLS completion fixture also needs passwordless `sudo` to bind its
-dedicated loopback address on port 443; it uses generated test certificates
-and kernel channels, not an Azure endpoint.
+The suite uses installed Azure CLI, provider-free OpenTofu configurations,
+Bash and OpenSSL. The Linux TLS fixture needs passwordless `sudo` for its
+dedicated loopback address/port and uses generated test certificates.
 
-Live acceptance additionally requires isolated SP login, private endpoint
-access, explicit-host identity attachment, bootstrap creation/deletion,
-failure-before-yield cleanup and Windows Run Command. Those operations need an
-authorized test subscription and are not part of the offline test command.
-
-For a dedicated Windows guest, supply `ARM_TENANT_ID`, `ARM_SUBSCRIPTION_ID`,
-`ARM_CLIENT_ID` and `ARM_CLIENT_SECRET` in the environment, then set `GROUP`
-and `VM` to the authorized target:
+Cloud acceptance needs an explicitly assigned subscription/VM, SP authority,
+private endpoint access and managed-identity permissions. For an assigned
+Windows guest, supply the `ARM_*` identity/secret inputs and set `GROUP`/`VM`
+before running:
 
 ```sh
-uv run python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase plain &&
-uv run python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase sealed
+uv run --locked python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase plain &&
+uv run --locked python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase sealed
 ```
 
-These commands exercise native/PowerShell failures, truncated framing,
-encrypted multi-chunk output and exact key/directory cleanup. The sealed phase
-also inspects retained Run Command files and process command lines for its
-synthetic canary (including base64 and UTF-16 encodings). It does not install
-software, register runners or change networking.
+Those checks exercise failures, framing, encrypted output and exact key/directory
+cleanup. They do not install software, register runners or alter networking.
