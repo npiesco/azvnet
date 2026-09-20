@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Mapping, Sequence
 
 CLI_STDIN_PROGRAM = (
@@ -97,7 +98,6 @@ def checked(
     )
     if result.returncode:
         if capture:
-            print(result.stdout or "", end="", file=sys.stderr)
             print(result.stderr or "", end="", file=sys.stderr)
         raise subprocess.CalledProcessError(
             result.returncode,
@@ -229,6 +229,7 @@ class AzureSession:
         )
         self._directory: tempfile.TemporaryDirectory[str] | None = None
         self._authenticated = False
+        self._authentication_lock = threading.RLock()
 
     def __enter__(self) -> AzureSession:
         return self
@@ -237,12 +238,27 @@ class AzureSession:
         self.close()
 
     def close(self) -> None:
-        if self._directory:
-            self._directory.cleanup()
-            self._directory = None
-        self._authenticated = False
+        with self._authentication_lock:
+            if self._directory:
+                self._directory.cleanup()
+                self._directory = None
+                self.env.pop("AZURE_CONFIG_DIR", None)
+            self._authenticated = False
 
     def login(self) -> None:
+        with self._authentication_lock:
+            try:
+                self._login()
+            except BaseException as primary:
+                try:
+                    self.close()
+                except Exception as cleanup:
+                    message = f"Authentication cache cleanup also failed: {cleanup}"
+                    primary.add_note(message)
+                    print(message, file=sys.stderr)
+                raise
+
+    def _login(self) -> None:
         if self._authenticated:
             return
         if self.env.get("ARM_CLIENT_SECRET"):

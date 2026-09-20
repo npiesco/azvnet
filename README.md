@@ -95,6 +95,9 @@ Login invokes that CLI over stdin so its secret never enters the OS command
 line. Each service-principal session owns a mode-0700 temporary Azure config
 directory and removes it on exit. It never changes global `os.environ` or
 calls `az account set`.
+Concurrent first-use calls on one session share an authentication lock through
+login and identity verification; authenticated commands remain parallel.
+Close the session only after its callers have completed.
 CLI telemetry is disabled in that process environment so a background
 telemetry writer cannot recreate the removed config directory.
 On Linux, `TMPDIR=/dev/shm` keeps temporary credentials and transport keys in
@@ -256,6 +259,8 @@ separate successful stdout/stderr component statuses. Missing, duplicate or
 mixed component statuses fail closed.
 Sealed guest failures raise `RemoteExecutionError`; inspect its `returncode`,
 `stdout` and `stderr` privately. Its message does not print decrypted output.
+For checked local processes, failed captured stdout remains only in the
+exception's `stdout` attribute; stderr diagnostics are still reported.
 Successful capture returns stdout without Azure wrappers or the proof line.
 State pulls, named outputs, raw/JSON show/output, `-show-sensitive` and
 `-json-into` require `capture=True`; returned data still needs to be handled
@@ -280,7 +285,8 @@ uv pip install --python /path/to/venv/bin/python dist/azvnet-0.1.0-py3-none-any.
 ```
 
 Consumers can pin a reviewed public Git commit or distribute this wheel with
-its SHA-256 digest. No GitHub PAT or deploy key is needed for public source.
+its SHA-256 digest. The public Git dependency path requires Git locally.
+No GitHub PAT or deploy key is needed for public source.
 Consumers can validate this wheel before their pinned commit is public.
 Publishing source and validating a public install are separate release steps.
 

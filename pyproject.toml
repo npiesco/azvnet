@@ -6,8 +6,12 @@ build-backend = "hatchling.build"
 name = "azvnet"
 version = "0.1.0"
 description = "Checked Azure execution and OpenTofu inside a private VNet"
+readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
+
+[project.urls]
+Repository = "https://github.com/npiesco/azvnet"
 
 [dependency-groups]
 dev = ["ruff==0.14.10", "mypy==1.19.1"]
