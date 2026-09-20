@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320" viewBox="0 0 320 320" role="img" aria-labelledby="title description">
+  <title id="title">azvnet</title>
+  <desc id="description">A terminal connected to four nodes inside a private network boundary.</desc>
+  <rect width="320" height="320" rx="64" fill="#0b1220"/>
+  <path d="M160 36 268 98v124l-108 62L52 222V98Z" fill="#38bdf8"/>
+  <path d="m160 46 99 57v114l-99 57-99-57V103Z" fill="#0b1220"/>
+  <g fill="none" stroke="#5eead4" stroke-width="8">
+    <path d="M160 84v34M78 160h34M208 160h34M160 202v34"/>
+  </g>
+  <g fill="#5eead4">
+    <circle cx="160" cy="80" r="12"/>
+    <circle cx="78" cy="160" r="12"/>
+    <circle cx="242" cy="160" r="12"/>
+    <circle cx="160" cy="240" r="12"/>
+  </g>
+  <rect x="100" y="114" width="120" height="92" rx="16" fill="#f1f5f9"/>
+  <path d="m126 143 18 17-18 17M158 177h32" fill="none" stroke="#0b1220" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,4 +1,14 @@
-# azvnet
+<div align="center">
+  <img src="assets/logo.svg" alt="azvnet: a terminal inside a private network" width="240"/>
+  <h1>azvnet</h1>
+
+  [![Version](https://img.shields.io/badge/version-0.1.0-38bdf8)](pyproject.toml)
+  [![Python](https://img.shields.io/badge/python-3.12%2B-3776ab?logo=python&logoColor=white)](pyproject.toml)
+  [![Runtime Python dependencies](https://img.shields.io/badge/runtime%20Python%20dependencies-0-2dd4bf)](pyproject.toml)
+  [![License](https://img.shields.io/badge/license-MIT-38bdf8)](LICENSE)
+</div>
+
+---
 
 You have your infrastructure repo and Azure credential, but your OpenTofu
 backend only accepts connections from a private VNet. Delete the last VM
