@@ -124,6 +124,13 @@ def azure_cli(cli_python: Path | None) -> list[str]:
 
 
 def private_text(path: Path) -> str:
+    if sys.platform == "win32":
+        from ._private import private_text as windows_private_text
+
+        text, reason = windows_private_text(path)
+        if text is None:
+            raise AzvnetError(f"{path}: {reason}")
+        return text
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, encoding="utf-8") as stream:
         metadata = os.fstat(stream.fileno())

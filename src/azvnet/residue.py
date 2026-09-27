@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 
 from .auth import AzvnetError
@@ -27,14 +28,25 @@ class CleanupResidue:
         while not ancestor.exists():
             missing.append(ancestor)
             ancestor = ancestor.parent
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        metadata = directory.lstat()
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o700
-        ):
-            raise AzvnetError("residue directory must be current-user-owned mode-0700")
+        if sys.platform == "win32":
+            from ._private import directory_violation, make_private_directory
+
+            directory.parent.mkdir(parents=True, exist_ok=True)
+            make_private_directory(directory)
+            reason = directory_violation(directory)
+            if reason is not None:
+                raise AzvnetError(f"residue directory {reason}")
+        else:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            metadata = directory.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise AzvnetError(
+                    "residue directory must be current-user-owned mode-0700"
+                )
         for created in reversed(missing):
             _sync_directory(created.parent)
         # The name is generated locally, never derived from remote output or a VM name.
@@ -52,6 +64,11 @@ class CleanupResidue:
 
 
 def _sync_directory(directory: Path) -> None:
+    if sys.platform == "win32":
+        from ._private import sync_directory
+
+        sync_directory(directory)
+        return
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)

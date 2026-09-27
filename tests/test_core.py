@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -65,6 +66,38 @@ def arm_response(
     )
 
 
+def current_user_sid() -> str:
+    """The current Windows user's SID, read with the in-box whoami."""
+    row = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return row.strip().split(",")[-1].strip('"')
+
+
+def restrict(path: Path) -> None:
+    """Make a file private: mode 0600, or a protected current-user-only DACL."""
+    if sys.platform == "win32":
+        users = "*S-1-5-32-545"
+        subprocess.run(["icacls", str(path), "/remove:g", users], capture_output=True, check=True)
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"*{current_user_sid()}:F"],
+            capture_output=True, check=True,
+        )
+    else:
+        path.chmod(0o600)
+
+
+def broaden(path: Path) -> None:
+    """Let other local users read a file: mode 0644, or a BUILTIN\\Users read ACE."""
+    if sys.platform == "win32":
+        subprocess.run(
+            ["icacls", str(path), "/grant", "*S-1-5-32-545:R"], capture_output=True, check=True,
+        )
+    else:
+        path.chmod(0o644)
+
+
 class CredentialsTests(unittest.TestCase):
     def resolve(self, env, path=None, interactive=False):
         return credentials(
@@ -101,12 +134,12 @@ class CredentialsTests(unittest.TestCase):
             path.write_text(
                 "Tenant: tenant\nClient ID: client\nSecret: test-only-value\n"
             )
-            path.chmod(0o600)
+            restrict(path)
             self.assertEqual(self.resolve({}, path)["ARM_CLIENT_ID"], "client")
-            path.chmod(0o644)
+            broaden(path)
             with self.assertRaises(AzvnetError):
                 self.resolve({}, path)
-            path.chmod(0o600)
+            restrict(path)
             path.write_text(
                 "Tenant: other\nClient ID: client\nSecret: test-only-value\n"
             )

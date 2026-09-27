@@ -4,11 +4,14 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 from azvnet import AzureSession, checked, non_azure_env, tf_var_environment
 from azvnet.tofu import Identity, configuration_bundle, guest_script, remote_arguments
+
+from test_core import restrict
 
 
 class NativeGuestParityTests(unittest.TestCase):
@@ -16,14 +19,18 @@ class NativeGuestParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             credential = root / "credential"
-            credential.touch(mode=0o600)
             credential.write_text(
                 "Tenant: tenant\nClient ID: client\nSecret: synthetic-file-secret\n"
             )
+            restrict(credential)
+            # The Python running this suite is a real child interpreter on every platform.
+            python = json.dumps(sys.executable)
             (root / "main.tf").write_text(
                 'resource "terraform_data" "environment" {\n'
                 ' provisioner "local-exec" {\n'
-                '  command = "test \\"$ARM_CLIENT_SECRET\\" = synthetic-file-secret"\n'
+                f"  interpreter = [{python}, \"-c\"]\n"
+                '  command = "import os, sys; '
+                "sys.exit(os.environ.get('ARM_CLIENT_SECRET') != 'synthetic-file-secret')\"\n"
                 " }\n}\n"
             )
             before = dict(os.environ)
@@ -36,7 +43,10 @@ class NativeGuestParityTests(unittest.TestCase):
                 session.local_tofu("init", "-backend=false", workdir=root, capture=True)
                 session.local_tofu("apply", "-auto-approve", workdir=root, capture=True)
                 checked(
-                    ["bash", "-c", 'test -z "${ARM_CLIENT_SECRET+x}"'],
+                    [
+                        sys.executable, "-c",
+                        "import os, sys; sys.exit('ARM_CLIENT_SECRET' in os.environ)",
+                    ],
                     env=non_azure_env(session.env),
                     capture=True,
                 )
