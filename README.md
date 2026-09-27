@@ -325,5 +325,10 @@ uv run --locked python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase
 uv run --locked python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase sealed
 ```
 
+With `--interactive`, the session instead reuses the cached Azure CLI user of an
+explicitly set `AZURE_CONFIG_DIR` (with `ARM_TENANT_ID` and
+`ARM_SUBSCRIPTION_ID`), and verifies that context is still present afterwards
+rather than removed. No client ID or secret is read.
+
 Those checks exercise failures, framing, encrypted output and exact key/directory
 cleanup. They do not install software, register runners or alter networking.
