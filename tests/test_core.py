@@ -66,6 +66,30 @@ def arm_response(
     )
 
 
+def posix_bash() -> str:
+    """A real POSIX bash; on Windows, Git for Windows' own (never the WSL launcher)."""
+    if sys.platform != "win32":
+        return "bash"
+    import winreg
+
+    # Git for Windows records its installation here; other Git builds may lack bash.
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\GitForWindows") as key:
+        root = Path(winreg.QueryValueEx(key, "InstallPath")[0])
+    bash = root / "bin" / "bash.exe"
+    if not bash.is_file():
+        raise FileNotFoundError(bash)
+    return str(bash)
+
+
+BASH = posix_bash()
+if sys.platform == "win32":
+    # Git for Windows' bash converts POSIX paths for native programs (the guest
+    # scripts' python3 needs that), but it also rewrote openssl's certificate
+    # subject `-subj /CN=azvnet` into `C:/Program Files/Git/CN=azvnet`. A subject
+    # is not a path, so exclude exactly that argument form from conversion.
+    os.environ["MSYS2_ARG_CONV_EXCL"] = "/CN="
+
+
 def current_user_sid() -> str:
     """The current Windows user's SID, read with the in-box whoami."""
     row = subprocess.run(
@@ -257,7 +281,7 @@ class CompletionTests(unittest.TestCase):
 
     def shell(self, script):
         return subprocess.run(
-            ["bash"],
+            [BASH],
             input=completion_script(script, self.token),
             text=True,
             capture_output=True,
@@ -313,7 +337,7 @@ class CompletionTests(unittest.TestCase):
     def test_captured_process_failure_is_visible(self):
         output = io.StringIO()
         with redirect_stderr(output), self.assertRaises(subprocess.CalledProcessError):
-            checked(["bash", "-c", "echo useful-diagnostic >&2; exit 7"], capture=True)
+            checked([BASH, "-c", "echo useful-diagnostic >&2; exit 7"], capture=True)
         self.assertIn("useful-diagnostic", output.getvalue())
 
 
@@ -421,7 +445,7 @@ class ExecutableTests(unittest.TestCase):
             (Path(scratch) / "response.b64").write_text("ABCDEFGHIJK")
             script = output_chunk_script(scratch, 2, 4, windows=False)
             result = subprocess.run(
-                ["bash"], input=script, text=True, capture_output=True, check=True
+                [BASH], input=script, text=True, capture_output=True, check=True
             )
             self.assertEqual(result.stdout, "CDEF")
         windows = output_chunk_script(r"C:\private", 2, 4, windows=True)
@@ -434,7 +458,7 @@ class ExecutableTests(unittest.TestCase):
             guest, caller = root / "guest", root / "caller"
             for directory in (guest, caller):
                 subprocess.run(
-                    ["bash", "-se"],
+                    [BASH, "-se"],
                     input=linux_key_setup(str(directory)),
                     text=True,
                     capture_output=True,
@@ -445,7 +469,7 @@ class ExecutableTests(unittest.TestCase):
                 (guest / "cert.pem").read_text(), payload.encode()
             )
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=linux_envelope(
                     str(guest),
                     ciphertext,
@@ -467,7 +491,7 @@ class ExecutableTests(unittest.TestCase):
             guest, caller = root / "guest", root / "caller"
             for directory in (guest, caller):
                 subprocess.run(
-                    ["bash", "-se"],
+                    [BASH, "-se"],
                     input=linux_key_setup(str(directory)),
                     text=True,
                     capture_output=True,
@@ -482,7 +506,7 @@ class ExecutableTests(unittest.TestCase):
                 str(guest), encrypted, (caller / "cert.pem").read_text()
             )
             result = subprocess.run(
-                ["bash"], input=script, text=True, capture_output=True, check=True
+                [BASH], input=script, text=True, capture_output=True, check=True
             )
             self.assertNotIn(canary, result.stdout + result.stderr + script)
             self.assertTrue(result.stdout.startswith("AZVNETOUTPUT "))
@@ -546,7 +570,7 @@ echo 'serial guard passed'
 """
             guest = root / "guest"
             setup = subprocess.run(
-                ["bash", "-se"],
+                [BASH, "-se"],
                 input=linux_key_setup(str(guest)),
                 text=True,
                 capture_output=True,
@@ -556,7 +580,7 @@ echo 'serial guard passed'
             transport = linux_envelope(str(guest), encrypted)
             self.assertNotIn("synthetic-state-canary", transport)
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=transport,
                 text=True,
                 capture_output=True,
@@ -588,7 +612,7 @@ echo 'serial guard passed'
 
             def execute():
                 return subprocess.run(
-                    ["bash"],
+                    [BASH],
                     input=script,
                     text=True,
                     capture_output=True,
@@ -638,7 +662,7 @@ echo 'serial guard passed'
                 tofu_version=version,
             )
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=script,
                 text=True,
                 capture_output=True,
@@ -689,7 +713,7 @@ echo 'serial guard passed'
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch) / "guest"
             setup = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=completion_script(linux_key_setup(str(root)), "setup123"),
                 text=True,
                 capture_output=True,
@@ -710,13 +734,13 @@ echo 'serial guard passed'
             script = linux_envelope(str(root), encrypted)
             self.assertNotIn(payload.decode().strip(), script)
             result = subprocess.run(
-                ["bash"], input=script, text=True, capture_output=True, check=True
+                [BASH], input=script, text=True, capture_output=True, check=True
             )
             self.assertEqual(result.stdout, "payload-executed\n")
             self.assertFalse(root.exists())
             corrupted = base64.b64encode(b"not CMS").decode()
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=linux_envelope(str(corrupt_dir), corrupted),
                 text=True,
                 capture_output=True,
@@ -749,7 +773,7 @@ echo 'serial guard passed'
             )
             environment = {**os.environ, "AZVNET_CANARY": "never-print-this"}
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=script,
                 text=True,
                 capture_output=True,
@@ -769,7 +793,7 @@ echo 'serial guard passed'
                 tofu_version=version,
             )
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=empty,
                 text=True,
                 capture_output=True,

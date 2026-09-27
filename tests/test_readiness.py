@@ -8,6 +8,8 @@ import unittest
 from azvnet import non_azure_env
 from azvnet.tofu import endpoint_probe_script
 
+from test_core import BASH
+
 
 TLS_SERVER = r"""
 import socket, ssl, sys
@@ -89,7 +91,7 @@ class EndpointCompletionTests(unittest.TestCase):
                         script = endpoint_probe_script("127.0.0.2")
                         self.assertNotIn("timeout=", script)
                         probe = subprocess.Popen(
-                            ["bash"],
+                            [BASH],
                             env=env,
                             stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE,

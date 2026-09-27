@@ -11,7 +11,7 @@ import unittest
 from azvnet import AzureSession, checked, non_azure_env, tf_var_environment
 from azvnet.tofu import Identity, configuration_bundle, guest_script, remote_arguments
 
-from test_core import restrict
+from test_core import BASH, restrict
 
 
 class NativeGuestParityTests(unittest.TestCase):
@@ -73,7 +73,7 @@ class NativeGuestParityTests(unittest.TestCase):
 
     def execute(self, script):
         return subprocess.run(
-            ["bash"],
+            [BASH],
             input=script,
             text=True,
             capture_output=True,
