@@ -71,6 +71,11 @@ Set `AZVNET_CLI_PYTHON` to the Python interpreter containing your installed
 export AZVNET_CLI_PYTHON=/opt/az/bin/python3
 ```
 
+On a Windows controller the variable is required: `az` is installed as
+`az.cmd`, so azvnet runs the command that file wraps, `<AZVNET_CLI_PYTHON>
+-IBm azure.cli`, without `cmd.exe`. For Microsoft's MSI it is
+`C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe`.
+
 Tenant, subscription and client IDs come from the configuration below.
 Conflicting `ARM_*` values are rejected.
 

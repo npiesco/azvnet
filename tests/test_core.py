@@ -20,7 +20,7 @@ from azvnet import (
     credentials,
     private_text,
 )
-from azvnet.auth import CLI_STDIN_PROGRAM, checked
+from azvnet.auth import CLI_STDIN_PROGRAM, azure_cli, checked
 from azvnet.remote import (
     MAX_OUTPUT_BYTES,
     cleanup_after,
@@ -630,11 +630,24 @@ echo 'serial guard passed'
             )
             self.assertIn("azure-cli", json.loads(result.stdout))
 
+    def test_platform_cli_command(self):
+        if os.name == "nt":
+            with self.assertRaisesRegex(AzvnetError, "AZVNET_CLI_PYTHON"):
+                azure_cli(None)
+            python = Path(r"C:\cli\python.exe")
+            self.assertEqual(azure_cli(python), [str(python), "-IBm", "azure.cli"])
+        else:
+            self.assertEqual(azure_cli(None), ["az"])
+
     def test_actual_cli_failure_is_not_empty_success(self):
+        cli_python = os.environ.get("AZVNET_CLI_PYTHON")
         with tempfile.TemporaryDirectory() as scratch, redirect_stderr(io.StringIO()):
             with self.assertRaises(subprocess.CalledProcessError):
                 checked(
-                    ["az", "azvnet-invalid-command"],
+                    [
+                        *azure_cli(Path(cli_python) if cli_python else None),
+                        "azvnet-invalid-command",
+                    ],
                     env={**os.environ, "AZURE_CONFIG_DIR": scratch},
                     capture=True,
                 )
