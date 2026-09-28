@@ -108,7 +108,29 @@ def checked(
     return result
 
 
+def azure_cli(cli_python: Path | None) -> list[str]:
+    """The Azure CLI command prefix on this platform."""
+    if os.name != "nt":
+        return ["az"]
+    # Windows installs `az` as az.cmd. CreateProcess starts only executables, and a
+    # batch file would re-parse every argument through cmd.exe, so run the
+    # interpreter command az.cmd itself runs.
+    if cli_python is None:
+        raise AzvnetError(
+            "set AZVNET_CLI_PYTHON to the Python interpreter containing azure.cli "
+            "(or pass cli_python); Windows runs the Azure CLI through it"
+        )
+    return [str(cli_python), "-IBm", "azure.cli"]
+
+
 def private_text(path: Path) -> str:
+    if sys.platform == "win32":
+        from ._private import private_text as windows_private_text
+
+        text, reason = windows_private_text(path)
+        if text is None:
+            raise AzvnetError(f"{path}: {reason}")
+        return text
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, encoding="utf-8") as stream:
         metadata = os.fstat(stream.fileno())
@@ -330,7 +352,7 @@ class AzureSession:
 
     def _invoke(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
         return checked(
-            ["az", *arguments, "--only-show-errors"],
+            [*azure_cli(self.cli_python), *arguments, "--only-show-errors"],
             env=self.env,
             capture=True,
         )

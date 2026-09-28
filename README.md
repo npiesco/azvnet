@@ -71,6 +71,11 @@ Set `AZVNET_CLI_PYTHON` to the Python interpreter containing your installed
 export AZVNET_CLI_PYTHON=/opt/az/bin/python3
 ```
 
+On a Windows controller the variable is required: `az` is installed as
+`az.cmd`, so azvnet runs the command that file wraps, `<AZVNET_CLI_PYTHON>
+-IBm azure.cli`, without `cmd.exe`. For Microsoft's MSI it is
+`C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe`.
+
 Tenant, subscription and client IDs come from the configuration below.
 Conflicting `ARM_*` values are rejected.
 
@@ -84,6 +89,11 @@ Secret: <runtime secret>
 ```
 
 No credential filename is assumed. Do not commit that file.
+
+On Windows, where mode bits do not describe access, the file must not be a
+symlink or other reparse point, must be owned by the current user, and must
+have a protected DACL granting access only to that user, for example
+`icacls <file> /inheritance:r /grant:r "%USERNAME%:F"`.
 
 ### 3. Configure the VNet and run the plan
 
@@ -274,7 +284,10 @@ def record_cleanup(residue: CleanupResidue) -> Path:
 Receipts contain the exact subscription/group/VM, invocation directory/token,
 OS and Windows certificate subject where applicable. They contain no payload,
 output, key bytes or credential. Files are owned mode 0600 in a mode-0700
-directory. Without a callback, diagnostics go to stderr without durable storage.
+directory. On Windows the directory is created with a protected DACL granting
+only the current user, its records inherit it, and an existing directory must
+be that user's, with that DACL, and not a reparse point. Without a callback,
+diagnostics go to stderr without durable storage.
 
 A receipt means cleanup is **unconfirmed**, not that a key definitely remains.
 Establish that the original and any competing Run Command have finished before
@@ -311,6 +324,11 @@ before running:
 uv run --locked python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase plain &&
 uv run --locked python tests/live_windows.py --group "$GROUP" --vm "$VM" --phase sealed
 ```
+
+With `--interactive`, the session instead reuses the cached Azure CLI user of an
+explicitly set `AZURE_CONFIG_DIR` (with `ARM_TENANT_ID` and
+`ARM_SUBSCRIPTION_ID`), and verifies that context is still present afterwards
+rather than removed. No client ID or secret is read.
 
 Those checks exercise failures, framing, encrypted output and exact key/directory
 cleanup. They do not install software, register runners or alter networking.

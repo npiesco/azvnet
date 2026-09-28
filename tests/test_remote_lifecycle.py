@@ -83,12 +83,21 @@ os._exit(0)
             ]
             for child in children:
                 self.assertEqual(child.wait(), 0)
-            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
             files = list(root.iterdir())
             self.assertEqual(len(files), 4)
+            if sys.platform == "win32":
+                from azvnet._private import directory_violation, file_violation
+
+                self.assertIsNone(directory_violation(root))
+            else:
+                self.assertEqual(root.stat().st_mode & 0o777, 0o700)
             for path in files:
-                self.assertEqual(path.stat().st_uid, os.getuid())
-                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                if sys.platform == "win32":
+                    # Receipts inherit the protected current-user-only directory DACL.
+                    self.assertIsNone(file_violation(path, protected=False))
+                else:
+                    self.assertEqual(path.stat().st_uid, os.getuid())
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                 data = json.loads(path.read_text())
                 self.assertEqual(
                     set(data), set(asdict(CleanupResidue("", "", "", "", "", "")))
@@ -113,13 +122,25 @@ os._exit(0)
             with self.assertRaises(AzvnetError):
                 receipt.write(directory)
             link = root / "alias"
-            link.symlink_to(root, target_is_directory=True)
+            if sys.platform == "win32":
+                import _winapi
+
+                # A junction is a directory reparse point that needs no privilege.
+                _winapi.CreateJunction(str(root), str(link))
+            else:
+                link.symlink_to(root, target_is_directory=True)
             with self.assertRaises(AzvnetError):
                 receipt.write(link)
             blocked = root / "file"
             blocked.touch()
             with self.assertRaises(OSError):
                 receipt.write(blocked / "child")
+            if sys.platform == "win32":
+                # Every Windows installation has this directory, owned by SYSTEM.
+                with self.assertRaisesRegex(AzvnetError, "owned by the current user"):
+                    receipt.write(Path(os.environ["ProgramData"]))
+                os.rmdir(link)
+                return
             own = root / "owned"
             own.mkdir(mode=0o700)
             other = 65534 if os.getuid() != 65534 else 0

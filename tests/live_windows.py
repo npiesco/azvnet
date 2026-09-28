@@ -20,17 +20,28 @@ def main() -> None:
     parser.add_argument(
         "--phase", choices=["plain", "sealed", "inspect"], required=True
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="reuse the cached Azure CLI user of AZURE_CONFIG_DIR instead of a service principal",
+    )
     args = parser.parse_args()
 
     def timeout(signum, frame):
         raise TimeoutError("whole-job Windows acceptance watchdog")
 
     signal.signal(signal.SIGTERM, timeout)
-    with AzureSession(
-        tenant_id=os.environ["ARM_TENANT_ID"],
-        subscription_id=os.environ["ARM_SUBSCRIPTION_ID"],
-        client_id=os.environ["ARM_CLIENT_ID"],
-    ) as azure:
+    identity = {
+        "tenant_id": os.environ["ARM_TENANT_ID"],
+        "subscription_id": os.environ["ARM_SUBSCRIPTION_ID"],
+    }
+    if args.interactive:
+        # The caller selects the cached CLI context explicitly; it is never guessed.
+        ambient = Path(os.environ["AZURE_CONFIG_DIR"])
+        session = AzureSession(**identity, interactive=True)
+    else:
+        session = AzureSession(**identity, client_id=os.environ["ARM_CLIENT_ID"])
+    with session as azure:
         remote = Remote(azure)
         if args.phase == "plain":
             result = remote.run(
@@ -161,9 +172,10 @@ Write-Output "canary scan passed: $files files, $decoded encoded values"
                     args.group, args.vm, scan, windows=True, capture=True
                 )
             except RemoteExecutionError as error:
-                diagnostic = error.stderr.replace(
-                    os.environ["ARM_CLIENT_SECRET"], "[redacted]"
-                )
+                diagnostic = error.stderr
+                secret = os.environ.get("ARM_CLIENT_SECRET")
+                if secret:
+                    diagnostic = diagnostic.replace(secret, "[redacted]")
                 print(diagnostic.replace(canary, "[synthetic-canary]"), flush=True)
                 raise
             assert "canary scan passed:" in result.stdout
@@ -187,6 +199,11 @@ Write-Output 'no task directories or certificates remain'
             ).stdout
         )
         cache = Path(azure.env["AZURE_CONFIG_DIR"])
+    if args.interactive:
+        # An interactive session reuses the caller's cache; it must survive intact.
+        assert cache == ambient and cache.is_dir()
+        print("PASS task certificate/directory cleanup; cached CLI context kept", flush=True)
+        return
     assert not cache.exists()
     print("PASS task certificate/directory and private CLI cache cleanup", flush=True)
 

@@ -11,6 +11,8 @@ from azvnet import non_azure_env
 from azvnet.auth import AzvnetError, require_capture
 from azvnet.tofu import Identity, configuration_bundle, guest_script
 
+from test_core import BASH
+
 CANARY = "synthetic-a06-sensitive-output"
 CHILD = r"""
 import json
@@ -122,8 +124,6 @@ class CaptureProcessTests(unittest.TestCase):
                 ["output", "-state", str(self.root / "terraform.tfstate"), "secret"],
                 ["output", "--state=" + str(self.root / "terraform.tfstate"), "secret"],
                 ["state", "pull"],
-                ["output", "-json-into=/dev/stdout"],
-                ["show", "--json-into=/dev/stderr"],
                 [f"-chdir={self.root}", "output", "secret"],
                 [f"-chdir={self.root}", "show", "--json=true"],
                 [f"-chdir={self.root}", "state", "pull"],
@@ -134,6 +134,27 @@ class CaptureProcessTests(unittest.TestCase):
                 native = self.native(arguments)
                 self.assertIn(CANARY, native.stdout + native.stderr)
                 self.assert_guarded(arguments)
+
+    def test_json_exports_require_capture(self):
+        # A real export file stands in for /dev/stdout, which Windows does not have.
+        for verb, flag in (("output", "-json-into"), ("show", "--json-into")):
+            target = self.root / f"{verb}-export.json"
+            arguments = [verb, f"{flag}={target}"]
+            with self.subTest(arguments=arguments):
+                self.native(arguments)
+                self.assertIn(CANARY, target.read_text(encoding="utf-8"))
+                target.unlink()
+                for route in ("local", "remote"):
+                    result = self.child(arguments, route=route)
+                    self.assertEqual(result.returncode, 17, result.stderr)
+                    self.assertIn("capture=True", result.stderr)
+                    self.assertNotIn(CANARY, result.stdout + result.stderr)
+                    self.assertFalse(target.exists())
+                captured = self.child(arguments, capture=True)
+                self.assertEqual(captured.returncode, 0, captured.stderr)
+                self.assertNotIn(CANARY, captured.stdout + captured.stderr)
+                self.assertIn(CANARY, target.read_text(encoding="utf-8"))
+                target.unlink()
 
     def test_safe_listing_and_false_boolean_forms_stay_safe(self):
         cases = [["output"], ["show"], ["output", "--"]]
@@ -222,7 +243,7 @@ class CaptureProcessTests(unittest.TestCase):
                 tofu_version=version,
             )
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=script,
                 text=True,
                 env=self.env,

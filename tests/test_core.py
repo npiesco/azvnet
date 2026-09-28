@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -20,7 +21,7 @@ from azvnet import (
     credentials,
     private_text,
 )
-from azvnet.auth import CLI_STDIN_PROGRAM, checked
+from azvnet.auth import CLI_STDIN_PROGRAM, azure_cli, checked
 from azvnet.remote import (
     MAX_OUTPUT_BYTES,
     cleanup_after,
@@ -65,6 +66,62 @@ def arm_response(
     )
 
 
+def posix_bash() -> str:
+    """A real POSIX bash; on Windows, Git for Windows' own (never the WSL launcher)."""
+    if sys.platform != "win32":
+        return "bash"
+    import winreg
+
+    # Git for Windows records its installation here; other Git builds may lack bash.
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\GitForWindows") as key:
+        root = Path(winreg.QueryValueEx(key, "InstallPath")[0])
+    bash = root / "bin" / "bash.exe"
+    if not bash.is_file():
+        raise FileNotFoundError(bash)
+    return str(bash)
+
+
+BASH = posix_bash()
+if sys.platform == "win32":
+    # Git for Windows' bash converts POSIX paths for native programs (the guest
+    # scripts' python3 needs that), but it also rewrote openssl's certificate
+    # subject `-subj /CN=azvnet` into `C:/Program Files/Git/CN=azvnet`. A subject
+    # is not a path, so exclude exactly that argument form from conversion.
+    os.environ["MSYS2_ARG_CONV_EXCL"] = "/CN="
+
+
+def current_user_sid() -> str:
+    """The current Windows user's SID, read with the in-box whoami."""
+    row = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return row.strip().split(",")[-1].strip('"')
+
+
+def restrict(path: Path) -> None:
+    """Make a file private: mode 0600, or a protected current-user-only DACL."""
+    if sys.platform == "win32":
+        users = "*S-1-5-32-545"
+        subprocess.run(["icacls", str(path), "/remove:g", users], capture_output=True, check=True)
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"*{current_user_sid()}:F"],
+            capture_output=True, check=True,
+        )
+    else:
+        path.chmod(0o600)
+
+
+def broaden(path: Path) -> None:
+    """Let other local users read a file: mode 0644, or a BUILTIN\\Users read ACE."""
+    if sys.platform == "win32":
+        subprocess.run(
+            ["icacls", str(path), "/grant", "*S-1-5-32-545:R"], capture_output=True, check=True,
+        )
+    else:
+        path.chmod(0o644)
+
+
 class CredentialsTests(unittest.TestCase):
     def resolve(self, env, path=None, interactive=False):
         return credentials(
@@ -101,12 +158,12 @@ class CredentialsTests(unittest.TestCase):
             path.write_text(
                 "Tenant: tenant\nClient ID: client\nSecret: test-only-value\n"
             )
-            path.chmod(0o600)
+            restrict(path)
             self.assertEqual(self.resolve({}, path)["ARM_CLIENT_ID"], "client")
-            path.chmod(0o644)
+            broaden(path)
             with self.assertRaises(AzvnetError):
                 self.resolve({}, path)
-            path.chmod(0o600)
+            restrict(path)
             path.write_text(
                 "Tenant: other\nClient ID: client\nSecret: test-only-value\n"
             )
@@ -224,7 +281,7 @@ class CompletionTests(unittest.TestCase):
 
     def shell(self, script):
         return subprocess.run(
-            ["bash"],
+            [BASH],
             input=completion_script(script, self.token),
             text=True,
             capture_output=True,
@@ -280,7 +337,7 @@ class CompletionTests(unittest.TestCase):
     def test_captured_process_failure_is_visible(self):
         output = io.StringIO()
         with redirect_stderr(output), self.assertRaises(subprocess.CalledProcessError):
-            checked(["bash", "-c", "echo useful-diagnostic >&2; exit 7"], capture=True)
+            checked([BASH, "-c", "echo useful-diagnostic >&2; exit 7"], capture=True)
         self.assertIn("useful-diagnostic", output.getvalue())
 
 
@@ -388,7 +445,7 @@ class ExecutableTests(unittest.TestCase):
             (Path(scratch) / "response.b64").write_text("ABCDEFGHIJK")
             script = output_chunk_script(scratch, 2, 4, windows=False)
             result = subprocess.run(
-                ["bash"], input=script, text=True, capture_output=True, check=True
+                [BASH], input=script, text=True, capture_output=True, check=True
             )
             self.assertEqual(result.stdout, "CDEF")
         windows = output_chunk_script(r"C:\private", 2, 4, windows=True)
@@ -401,7 +458,7 @@ class ExecutableTests(unittest.TestCase):
             guest, caller = root / "guest", root / "caller"
             for directory in (guest, caller):
                 subprocess.run(
-                    ["bash", "-se"],
+                    [BASH, "-se"],
                     input=linux_key_setup(str(directory)),
                     text=True,
                     capture_output=True,
@@ -412,7 +469,7 @@ class ExecutableTests(unittest.TestCase):
                 (guest / "cert.pem").read_text(), payload.encode()
             )
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=linux_envelope(
                     str(guest),
                     ciphertext,
@@ -434,7 +491,7 @@ class ExecutableTests(unittest.TestCase):
             guest, caller = root / "guest", root / "caller"
             for directory in (guest, caller):
                 subprocess.run(
-                    ["bash", "-se"],
+                    [BASH, "-se"],
                     input=linux_key_setup(str(directory)),
                     text=True,
                     capture_output=True,
@@ -449,7 +506,7 @@ class ExecutableTests(unittest.TestCase):
                 str(guest), encrypted, (caller / "cert.pem").read_text()
             )
             result = subprocess.run(
-                ["bash"], input=script, text=True, capture_output=True, check=True
+                [BASH], input=script, text=True, capture_output=True, check=True
             )
             self.assertNotIn(canary, result.stdout + result.stderr + script)
             self.assertTrue(result.stdout.startswith("AZVNETOUTPUT "))
@@ -513,7 +570,7 @@ echo 'serial guard passed'
 """
             guest = root / "guest"
             setup = subprocess.run(
-                ["bash", "-se"],
+                [BASH, "-se"],
                 input=linux_key_setup(str(guest)),
                 text=True,
                 capture_output=True,
@@ -523,7 +580,7 @@ echo 'serial guard passed'
             transport = linux_envelope(str(guest), encrypted)
             self.assertNotIn("synthetic-state-canary", transport)
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=transport,
                 text=True,
                 capture_output=True,
@@ -555,7 +612,7 @@ echo 'serial guard passed'
 
             def execute():
                 return subprocess.run(
-                    ["bash"],
+                    [BASH],
                     input=script,
                     text=True,
                     capture_output=True,
@@ -605,7 +662,7 @@ echo 'serial guard passed'
                 tofu_version=version,
             )
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=script,
                 text=True,
                 capture_output=True,
@@ -630,11 +687,24 @@ echo 'serial guard passed'
             )
             self.assertIn("azure-cli", json.loads(result.stdout))
 
+    def test_platform_cli_command(self):
+        if os.name == "nt":
+            with self.assertRaisesRegex(AzvnetError, "AZVNET_CLI_PYTHON"):
+                azure_cli(None)
+            python = Path(r"C:\cli\python.exe")
+            self.assertEqual(azure_cli(python), [str(python), "-IBm", "azure.cli"])
+        else:
+            self.assertEqual(azure_cli(None), ["az"])
+
     def test_actual_cli_failure_is_not_empty_success(self):
+        cli_python = os.environ.get("AZVNET_CLI_PYTHON")
         with tempfile.TemporaryDirectory() as scratch, redirect_stderr(io.StringIO()):
             with self.assertRaises(subprocess.CalledProcessError):
                 checked(
-                    ["az", "azvnet-invalid-command"],
+                    [
+                        *azure_cli(Path(cli_python) if cli_python else None),
+                        "azvnet-invalid-command",
+                    ],
                     env={**os.environ, "AZURE_CONFIG_DIR": scratch},
                     capture=True,
                 )
@@ -643,7 +713,7 @@ echo 'serial guard passed'
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch) / "guest"
             setup = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=completion_script(linux_key_setup(str(root)), "setup123"),
                 text=True,
                 capture_output=True,
@@ -664,13 +734,13 @@ echo 'serial guard passed'
             script = linux_envelope(str(root), encrypted)
             self.assertNotIn(payload.decode().strip(), script)
             result = subprocess.run(
-                ["bash"], input=script, text=True, capture_output=True, check=True
+                [BASH], input=script, text=True, capture_output=True, check=True
             )
             self.assertEqual(result.stdout, "payload-executed\n")
             self.assertFalse(root.exists())
             corrupted = base64.b64encode(b"not CMS").decode()
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=linux_envelope(str(corrupt_dir), corrupted),
                 text=True,
                 capture_output=True,
@@ -703,7 +773,7 @@ echo 'serial guard passed'
             )
             environment = {**os.environ, "AZVNET_CANARY": "never-print-this"}
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=script,
                 text=True,
                 capture_output=True,
@@ -723,7 +793,7 @@ echo 'serial guard passed'
                 tofu_version=version,
             )
             result = subprocess.run(
-                ["bash"],
+                [BASH],
                 input=empty,
                 text=True,
                 capture_output=True,
